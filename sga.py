@@ -1,9 +1,12 @@
-import time, requests
+import random, sys, time, requests
 import spidev, serial
 import RPi.GPIO as GPIO 
+from periphery import SPI
+from functools import reduce
+from math import log,ceil
 
-# environment = 'UAT'
-environment = 'SANDBOX'
+environment = 'UAT'
+#environment = 'SANDBOX'
 
 #interface = 'SPI'
 interface = 'USB'

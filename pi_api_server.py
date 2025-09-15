@@ -1,4 +1,3 @@
-# pi_api_server.py
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import subprocess
@@ -12,7 +11,7 @@ sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 # Import your modules
 try:
     import sga as sga
-    import Sandgrain_Credentials as credentials
+    import SandGrain_Credentials as credentials
 except ImportError as e:
     print(f"Import error: {e}")
     # Create mock functions for testing if modules aren't available
