@@ -15,26 +15,6 @@ try:
 except ImportError as e:
     print(f"Import error: {e}")
     # Create mock functions for testing if modules aren't available
-    class MockSGA:
-        def get_pccid(self):
-            return "mock_pccid_123456"
-        
-        def do_cyberrock_iot_login(self, tokens, username, password):
-            return "mock_token", "mock_iotid"
-            
-        def get_cyberrock_cw(self, tokens, accesstoken, pccid, request_sig):
-            return "mock_cw_abcdef", "mock_transaction_id"
-            
-        def do_rw_only(self, cw_list):
-            return "mock_rw_123456"
-            
-        def do_submit_rw(self, tokens, accesstoken, pccid, cw, rw, transactionid, request_sig):
-            return "mock_response_transaction_id"
-            
-        def do_retrieve_result(self, tokens, accesstoken, transactionid, request_sig):
-            return "AUTH_OK", "mock_claim_id"
-    
-    sga = MockSGA()
     
 
 app = Flask(__name__)
