@@ -1,7 +1,5 @@
-import argparse, os
 import RPi.GPIO as GPIO 
-import random, sys, time, requests
-from periphery import SPI
+import  sys
 from functools import reduce
 from math import log,ceil
  
