@@ -36,12 +36,6 @@ except ImportError as e:
     
     sga = MockSGA()
     
-    class MockCredentials:
-        cloudflaretokens = {'CF-Access-Client-Id': 'test', 'CF-Access-Client-Secret': 'test'}
-        iotusername = 'test'
-        iotpassword = 'test'
-    
-    credentials = MockCredentials()
 
 app = Flask(__name__)
 CORS(app)  # Enable Cross-Origin Requests
