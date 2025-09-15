@@ -5,8 +5,8 @@ from periphery import SPI
 from functools import reduce
 from math import log,ceil
 
-environment = 'UAT'
-#environment = 'SANDBOX'
+# environment = 'UAT'
+environment = 'SANDBOX'
 
 #interface = 'SPI'
 interface = 'USB'
