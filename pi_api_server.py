@@ -368,15 +368,15 @@ def set_led():
             'message': 'Failed to set LED'
         }), 500
 
+
+@app.route('/', methods=['GET'])
+def status():
+    """Check if the server is running"""
+    return jsonify({
+        'success': True,
+        'message': 'Raspberry Pi API Server is running!'
+    })
 if __name__ == '__main__':
-    print("Starting Raspberry Pi API Server...")
-    print("Available endpoints:")
-    print("  GET  /api/status")
-    print("  GET  /api/get-identity")
-    print("  POST /api/get-cw")
-    print("  POST /api/get-rw")
-    print("  POST /api/authenticate")
-    print("  GET  /api/full-auth")
-    print("  POST /api/led-status")
+    
     
     app.run(host='0.0.0.0', port=5000, debug=True)
