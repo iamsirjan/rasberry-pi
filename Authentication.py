@@ -7,7 +7,7 @@ from math import log,ceil
 sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 
 import sga as sga
-import SandGrain_Credentials as credentials
+import Sandgrain_Credentials as credentials
 
 
 API_G   =  5 # GPIO5 , Board pin 29
