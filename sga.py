@@ -6,7 +6,7 @@ from functools import reduce
 from math import log,ceil
 
 environment = 'UAT'
-# environment = 'SANDBOX'
+#environment = 'SANDBOX'
 
 #interface = 'SPI'
 interface = 'USB'
