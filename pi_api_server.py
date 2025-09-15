@@ -9,7 +9,6 @@ sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 # Import your modules
 try:
     import sga as sga
-    import SandGrain_Credentials as credentials
 except ImportError as e:
     print(f"Import error: {e}")
     # Create mock functions for testing if modules aren't available
