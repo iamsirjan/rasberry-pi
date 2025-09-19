@@ -45,7 +45,7 @@ except ImportError as e:
     credentials = MockCredentials()
 
 app = Flask(__name__)
-CORS(app)  # Enable Cross-Origin Requests
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # LED control functions
 def gpio_setup():
