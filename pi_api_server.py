@@ -7,6 +7,7 @@ import sys
 import os
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 # ------------------ Import SandGrain modules ------------------
@@ -182,6 +183,20 @@ def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT broker with result code {rc}")
     client.subscribe(f"pi/{DEVICE_ID}/command")
 
+def extract_json_response(response):
+    """
+    Ensure we always return a dictionary for MQTT.
+    Handles Flask Response objects, tuples (response, status), or dicts.
+    """
+    if hasattr(response, 'get_json'):
+        return response.get_json()
+    elif isinstance(response, tuple) and len(response) > 0 and hasattr(response[0], 'get_json'):
+        return response[0].get_json()
+    elif isinstance(response, dict):
+        return response
+    else:
+        return {"result": str(response)}
+
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
@@ -197,7 +212,7 @@ def on_message(client, userdata, msg):
             "authenticate": authenticate
         }
 
-        with app.app_context():  # FIX: ensures Flask context
+        with app.app_context():  # Flask context
             if function_name in command_map:
                 if function_name in ["get_cw", "get_rw", "authenticate"]:
                     class DummyRequest:
@@ -206,14 +221,7 @@ def on_message(client, userdata, msg):
                     response = command_map[function_name](DummyRequest())
                 else:
                     response = command_map[function_name]()
-                
-                # Ensure we always return a dict for MQTT
-                if hasattr(response, 'get_json'):
-                    payload_response = response.get_json()
-                elif isinstance(response, dict):
-                    payload_response = response
-                else:
-                    payload_response = {"result": str(response)}
+                payload_response = extract_json_response(response)
             else:
                 payload_response = {"error": f"Function {function_name} not found"}
 
