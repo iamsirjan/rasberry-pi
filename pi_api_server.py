@@ -190,7 +190,7 @@ def authenticate():
     ))
 
 # ------------------ MQTT Integration ------------------
-DEVICE_ID = os.getenv("DEVICE_NAME", "Pi-Default")
+DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
 BROKER = "54.255.173.75"
 
 def on_connect(client, userdata, flags, rc):
