@@ -84,96 +84,110 @@ def set_led_status(status):
     else:
         print(f"Mock LED status: {status}")
 
+# ------------------ Core Logic Functions (not Flask Responses) ------------------
+def logic_get_identity():
+    identity = sga.get_pccid()
+    return {"success": True, "identity": identity}
+
+def logic_get_cw(identity):
+    if not identity:
+        return {"success": False}
+    iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
+        credentials.cloudflaretokens,
+        credentials.iotusername,
+        credentials.iotpassword
+    )
+    cw, transactionid = sga.get_cyberrock_cw(
+        credentials.cloudflaretokens,
+        iotaccesstoken,
+        identity,
+        False
+    )
+    return {"success": True, "cw": cw, "transactionId": transactionid}
+
+def logic_get_rw(cw):
+    if not cw:
+        return {"success": False}
+    def intToList(number):
+        from math import log, ceil
+        L1 = log(number, 256)
+        L2 = ceil(L1)
+        if L1 == L2:
+            L2 += 1
+        return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
+
+    cw_int = int(cw, 16)
+    cw_list = intToList(cw_int)
+    rw = sga.do_rw_only(cw_list)
+    return {"success": True, "rw": rw}
+
+def logic_authenticate(identity, cw, rw, transaction_id):
+    if not all([identity, cw, rw, transaction_id]):
+        return {"success": False}
+    iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
+        credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
+    )
+    sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transaction_id, False)
+    auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transaction_id, False)
+    success = auth_result in ['CLAIM_ID', 'AUTH_OK']
+    return {"success": success}
+
 # ------------------ Flask Endpoints ------------------
 @app.route('/api/status', methods=['GET'])
 def api_status():
-    return jsonify({'success': True})
+    return jsonify({"success": True})
 
 @app.route('/api/get-identity', methods=['GET'])
-def get_identity():
+def api_get_identity():
     try:
         set_led_status('yellow')
-        identity = sga.get_pccid()
+        res = logic_get_identity()
         set_led_status('green')
-        return jsonify({'success': True, 'identity': identity})
-    except Exception as e:
+        return jsonify(res)
+    except:
         set_led_status('red')
-        return jsonify({'success': False})
+        return jsonify({"success": False})
 
 @app.route('/api/get-cw', methods=['POST'])
-def get_cw():
+def api_get_cw():
     try:
         set_led_status('yellow')
         data = request.get_json()
-        identity = data.get('identity')
-        if not identity:
-            return jsonify({'success': False}), 400
-
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens,
-            credentials.iotusername,
-            credentials.iotpassword
-        )
-        cw, transactionid = sga.get_cyberrock_cw(
-            credentials.cloudflaretokens,
-            iotaccesstoken,
-            identity,
-            False
-        )
+        res = logic_get_cw(data.get('identity'))
         set_led_status('green')
-        return jsonify({'success': True, 'cw': cw, 'transactionId': transactionid})
-    except Exception as e:
+        return jsonify(res)
+    except:
         set_led_status('red')
-        return jsonify({'success': False})
+        return jsonify({"success": False})
 
 @app.route('/api/get-rw', methods=['POST'])
-def get_rw():
+def api_get_rw():
     try:
         set_led_status('yellow')
         data = request.get_json()
-        cw = data.get('cw')
-        if not cw:
-            return jsonify({'success': False}), 400
-
-        def intToList(number):
-            from math import log, ceil
-            L1 = log(number, 256)
-            L2 = ceil(L1)
-            if L1 == L2:
-                L2 += 1
-            return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
-
-        cw_int = int(cw, 16)
-        cw_list = intToList(cw_int)
-        rw = sga.do_rw_only(cw_list)
+        res = logic_get_rw(data.get('cw'))
         set_led_status('green')
-        return jsonify({'success': True, 'rw': rw})
-    except Exception as e:
+        return jsonify(res)
+    except:
         set_led_status('red')
-        return jsonify({'success': False})
+        return jsonify({"success": False})
 
 @app.route('/api/authenticate', methods=['POST'])
-def authenticate():
+def api_authenticate():
     try:
         set_led_status('yellow')
         data = request.get_json()
-        identity = data.get('identity')
-        cw = data.get('cw')
-        rw = data.get('rw')
-        transaction_id = data.get('transactionId')
-        if not all([identity, cw, rw, transaction_id]):
-            return jsonify({'success': False}), 400
-
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
+        res = logic_authenticate(
+            data.get('identity'),
+            data.get('cw'),
+            data.get('rw'),
+            data.get('transactionId')
         )
-        sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transaction_id, False)
-        auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transaction_id, False)
-        set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
-        return jsonify({'success': auth_result in ['CLAIM_ID', 'AUTH_OK']})
-    except Exception as e:
+        set_led_status('green')
+        return jsonify(res)
+    except:
         set_led_status('red')
-        return jsonify({'success': False})
+        return jsonify({"success": False})
 
 # ------------------ MQTT Integration ------------------
 DEVICE_ID = os.getenv("DEVICE_NAME", "Pi-Default")
@@ -186,50 +200,30 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
-        function_name = payload.get("functionName")
-        args = payload.get("args", [])
-        print(f"Received MQTT command: {function_name}, args: {args}")
+        fn = payload.get("functionName")
+        args = payload.get("args", [{}])[0]  # default empty dict
 
-        command_map = {
-            "status": api_status,
-            "get_identity": get_identity,
-            "get_cw": get_cw,
-            "get_rw": get_rw,
-            "authenticate": authenticate
+        print(f"Received MQTT command: {fn}, args: {args}")
+
+        # Map function names to logic functions
+        logic_map = {
+            "get_identity": lambda _: logic_get_identity(),
+            "get_cw": lambda d: logic_get_cw(d.get('identity')),
+            "get_rw": lambda d: logic_get_rw(d.get('cw')),
+            "authenticate": lambda d: logic_authenticate(d.get('identity'), d.get('cw'), d.get('rw'), d.get('transactionId')),
+            "status": lambda _: {"success": True}
         }
 
-        with app.app_context():
-            if function_name in command_map:
-                # Wrap POST endpoints expecting JSON
-                if function_name in ["get_cw", "get_rw", "authenticate"]:
-                    class DummyRequest:
-                        def get_json(self_inner):
-                            return args[0] if args else {}
-                    response = command_map[function_name](DummyRequest())
-                else:
-                    response = command_map[function_name]()
+        if fn in logic_map:
+            result = logic_map[fn](args)
+        else:
+            result = {"success": False}
 
-                # Extract dict
-                if hasattr(response, 'get_json'):
-                    result_data = response.get_json()
-                elif isinstance(response, dict):
-                    result_data = response
-                else:
-                    result_data = {"success": True}
-
-                # Keep only success and identity (if exists)
-                clean_result = {'success': result_data.get('success', False)}
-                if 'identity' in result_data:
-                    clean_result['identity'] = result_data['identity']
-
-            else:
-                clean_result = {'success': False}
-
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(clean_result))
-        print(f"Sent MQTT response: {clean_result}")
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(result))
+        print(f"Sent MQTT response: {result}")
 
     except Exception as e:
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({'success': False}))
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False}))
         print(f"MQTT error: {e}")
 
 def run_mqtt():
@@ -239,7 +233,7 @@ def run_mqtt():
     client.connect(BROKER, 1883, 60)
     client.loop_forever()
 
-# Start MQTT in a separate thread
+# Start MQTT in separate thread
 threading.Thread(target=run_mqtt, daemon=True).start()
 
 # ------------------ Run Flask ------------------
