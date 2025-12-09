@@ -4,15 +4,15 @@ import paho.mqtt.client as mqtt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import sys
-from dotenv import load_dotenv
 import os
-
+from dotenv import load_dotenv
 
 load_dotenv()
-# ------------------ Import your SandGrain modules ------------------
+
+# ------------------ Import SandGrain modules ------------------
 sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 try:
-    import sga as sga
+    import sga
     import SandGrain_Credentials as credentials
 except ImportError:
     print("Modules not found, using mock implementations")
@@ -206,12 +206,20 @@ def on_message(client, userdata, msg):
                     response = command_map[function_name](DummyRequest())
                 else:
                     response = command_map[function_name]()
-                payload_response = response.get_json() if hasattr(response, 'get_json') else response
+                
+                # Ensure we always return a dict for MQTT
+                if hasattr(response, 'get_json'):
+                    payload_response = response.get_json()
+                elif isinstance(response, dict):
+                    payload_response = response
+                else:
+                    payload_response = {"result": str(response)}
             else:
                 payload_response = {"error": f"Function {function_name} not found"}
 
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps(payload_response))
         print(f"Sent MQTT response: {payload_response}")
+
     except Exception as e:
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"error": str(e)}))
         print(f"MQTT error: {e}")
