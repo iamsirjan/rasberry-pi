@@ -108,6 +108,7 @@ def get_cw():
         identity = data.get('identity')
         if not identity:
             return jsonify({'success': False}), 400
+
         iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
             credentials.cloudflaretokens,
             credentials.iotusername,
@@ -199,6 +200,7 @@ def on_message(client, userdata, msg):
 
         with app.app_context():
             if function_name in command_map:
+                # Wrap POST endpoints expecting JSON
                 if function_name in ["get_cw", "get_rw", "authenticate"]:
                     class DummyRequest:
                         def get_json(self_inner):
@@ -207,26 +209,27 @@ def on_message(client, userdata, msg):
                 else:
                     response = command_map[function_name]()
 
-                # Ensure MQTT payload is dict with only success and key
+                # Extract dict
                 if hasattr(response, 'get_json'):
-                    payload_response = response.get_json()
+                    result_data = response.get_json()
                 elif isinstance(response, dict):
-                    payload_response = response
+                    result_data = response
                 else:
-                    payload_response = {"success": True}
-                
-                # Keep only relevant keys
-                keys_to_keep = ['success', 'identity', 'cw', 'rw', 'transactionId']
-                payload_response = {k: payload_response[k] for k in keys_to_keep if k in payload_response}
+                    result_data = {"success": True}
+
+                # Keep only success and identity (if exists)
+                clean_result = {'success': result_data.get('success', False)}
+                if 'identity' in result_data:
+                    clean_result['identity'] = result_data['identity']
 
             else:
-                payload_response = {"success": False, "error": f"Function {function_name} not found"}
+                clean_result = {'success': False}
 
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(payload_response))
-        print(f"Sent MQTT response: {payload_response}")
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(clean_result))
+        print(f"Sent MQTT response: {clean_result}")
 
     except Exception as e:
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False, "error": str(e)}))
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({'success': False}))
         print(f"MQTT error: {e}")
 
 def run_mqtt():
