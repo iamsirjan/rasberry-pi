@@ -4,7 +4,10 @@ import paho.mqtt.client as mqtt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import sys
+from dotenv import load_dotenv
 
+
+load_dotenv()
 # ------------------ Import your SandGrain modules ------------------
 sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 try:
@@ -171,7 +174,7 @@ def authenticate():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 # ------------------ MQTT Integration ------------------
-DEVICE_ID = "pi_001"
+DEVICE_ID = os.getenv("DEVICE_NAME", "Pi-Default")
 BROKER = "54.255.173.75"
 
 def on_connect(client, userdata, flags, rc):
