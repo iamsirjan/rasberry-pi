@@ -7,7 +7,6 @@ import sys
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 # ------------------ Import SandGrain modules ------------------
@@ -88,7 +87,7 @@ def set_led_status(status):
 # ------------------ Flask Endpoints ------------------
 @app.route('/api/status', methods=['GET'])
 def api_status():
-    return jsonify({'status': 'ok', 'message': 'Raspberry Pi API is running'})
+    return jsonify({'success': True})
 
 @app.route('/api/get-identity', methods=['GET'])
 def get_identity():
@@ -99,7 +98,7 @@ def get_identity():
         return jsonify({'success': True, 'identity': identity})
     except Exception as e:
         set_led_status('red')
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False})
 
 @app.route('/api/get-cw', methods=['POST'])
 def get_cw():
@@ -108,7 +107,7 @@ def get_cw():
         data = request.get_json()
         identity = data.get('identity')
         if not identity:
-            return jsonify({'success': False, 'error': 'Identity is required'}), 400
+            return jsonify({'success': False}), 400
         iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
             credentials.cloudflaretokens,
             credentials.iotusername,
@@ -124,7 +123,7 @@ def get_cw():
         return jsonify({'success': True, 'cw': cw, 'transactionId': transactionid})
     except Exception as e:
         set_led_status('red')
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False})
 
 @app.route('/api/get-rw', methods=['POST'])
 def get_rw():
@@ -133,7 +132,7 @@ def get_rw():
         data = request.get_json()
         cw = data.get('cw')
         if not cw:
-            return jsonify({'success': False, 'error': 'CW is required'}), 400
+            return jsonify({'success': False}), 400
 
         def intToList(number):
             from math import log, ceil
@@ -150,7 +149,7 @@ def get_rw():
         return jsonify({'success': True, 'rw': rw})
     except Exception as e:
         set_led_status('red')
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False})
 
 @app.route('/api/authenticate', methods=['POST'])
 def authenticate():
@@ -162,7 +161,7 @@ def authenticate():
         rw = data.get('rw')
         transaction_id = data.get('transactionId')
         if not all([identity, cw, rw, transaction_id]):
-            return jsonify({'success': False, 'error': 'All parameters required'}), 400
+            return jsonify({'success': False}), 400
 
         iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
             credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
@@ -170,10 +169,10 @@ def authenticate():
         sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transaction_id, False)
         auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transaction_id, False)
         set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
-        return jsonify({'success': auth_result in ['CLAIM_ID', 'AUTH_OK'], 'authResult': auth_result, 'claimId': claim_id})
+        return jsonify({'success': auth_result in ['CLAIM_ID', 'AUTH_OK']})
     except Exception as e:
         set_led_status('red')
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False})
 
 # ------------------ MQTT Integration ------------------
 DEVICE_ID = os.getenv("DEVICE_NAME", "Pi-Default")
@@ -182,20 +181,6 @@ BROKER = "54.255.173.75"
 def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT broker with result code {rc}")
     client.subscribe(f"pi/{DEVICE_ID}/command")
-
-def extract_json_response(response):
-    """
-    Ensure we always return a dictionary for MQTT.
-    Handles Flask Response objects, tuples (response, status), or dicts.
-    """
-    if hasattr(response, 'get_json'):
-        return response.get_json()
-    elif isinstance(response, tuple) and len(response) > 0 and hasattr(response[0], 'get_json'):
-        return response[0].get_json()
-    elif isinstance(response, dict):
-        return response
-    else:
-        return {"result": str(response)}
 
 def on_message(client, userdata, msg):
     try:
@@ -212,7 +197,7 @@ def on_message(client, userdata, msg):
             "authenticate": authenticate
         }
 
-        with app.app_context():  # Flask context
+        with app.app_context():
             if function_name in command_map:
                 if function_name in ["get_cw", "get_rw", "authenticate"]:
                     class DummyRequest:
@@ -221,15 +206,27 @@ def on_message(client, userdata, msg):
                     response = command_map[function_name](DummyRequest())
                 else:
                     response = command_map[function_name]()
-                payload_response = extract_json_response(response)
+
+                # Ensure MQTT payload is dict with only success and key
+                if hasattr(response, 'get_json'):
+                    payload_response = response.get_json()
+                elif isinstance(response, dict):
+                    payload_response = response
+                else:
+                    payload_response = {"success": True}
+                
+                # Keep only relevant keys
+                keys_to_keep = ['success', 'identity', 'cw', 'rw', 'transactionId']
+                payload_response = {k: payload_response[k] for k in keys_to_keep if k in payload_response}
+
             else:
-                payload_response = {"error": f"Function {function_name} not found"}
+                payload_response = {"success": False, "error": f"Function {function_name} not found"}
 
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps(payload_response))
         print(f"Sent MQTT response: {payload_response}")
 
     except Exception as e:
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"error": str(e)}))
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False, "error": str(e)}))
         print(f"MQTT error: {e}")
 
 def run_mqtt():
