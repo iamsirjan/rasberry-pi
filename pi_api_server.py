@@ -191,7 +191,7 @@ def authenticate():
 
 # ------------------ MQTT Integration ------------------
 DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
-BROKER = "54.255.173.75"
+BROKER = "trust.sandgrain.io"
 
 def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT broker with result code {rc}")
