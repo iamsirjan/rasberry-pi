@@ -1,425 +1,502 @@
-import json
-import threading
-import paho.mqtt.client as mqtt
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import sys
-import os
-from dotenv import load_dotenv
-import time
+import random, sys, time, requests
 import serial
+import RPi.GPIO as GPIO
+from math import log, ceil
+import threading
 import glob
 from contextlib import contextmanager
 
-load_dotenv()
+# ==================== CONFIGURATION ====================
+# Switch between environments
+# environment = 'UAT'
+environment = 'SANDBOX'
 
-# ------------------ Device Pool for Multi-Device Support ------------------
+# Switch between interfaces
+interface = 'USB'
+# interface = 'SPI'
+
+# API Endpoints
+if environment == 'UAT':
+    cyberrock_iot_login = 'https://iot-api-uat.sandgrain.dev/api/auth/iotLogin'
+    cyberrock_iot_requestcw = 'https://iot-api-uat.sandgrain.dev/api/iot/requestCW'
+    cyberrock_iot_replyrw = 'https://iot-api-uat.sandgrain.dev/api/iot/replyRW'
+    cyberrock_iot_checkstatus = 'https://iot-api-uat.sandgrain.dev/api/iot/checkAuthStatus'
+    cyberrock_iot_immediateauth = 'https://iot-api-uat.sandgrain.dev/api/iot/immediateAuth'
+    cyberrock_iot_requestRWtransactionid = 'https://iot-api-uat.sandgrain.dev/api/iot/requestTransactionID'
+    cyberrock_iot_requestRW = 'https://iot-api-uat.sandgrain.dev/api/iot/requestRW'
+    cyberrock_iot_requestRWstatus = 'https://iot-api-uat.sandgrain.dev/api/iot/checkRequestRWStatus'
+    cyberrock_tenant_login = 'https://tenant-api-uat.sandgrain.dev/api/auth/tenantUserLogin'
+    cyberrock_tenant_claimid = 'https://tenant-api-uat.sandgrain.dev/api/tenantApi/claimId'
+    cyberrock_iot_requestcwek = 'https://iot-api-uat.sandgrain.dev/api/iot/ekrequestCW'
+    cyberrock_iot_replyrwek = 'https://iot-api-uat.sandgrain.dev/api/iot/ekreplyRW'
+    cyberrock_iot_checkstatusek = 'https://iot-api-uat.sandgrain.dev/api/iot/ekcheckAuthStatus'
+
+if environment == 'SANDBOX':
+    cyberrock_iot_login = 'https://iot-api.sandbox.sandgrain.io/api/auth/iotLogin'
+    cyberrock_iot_requestcw = 'https://iot-api.sandbox.sandgrain.io/api/iot/requestCW'
+    cyberrock_iot_replyrw = 'https://iot-api.sandbox.sandgrain.io/api/iot/replyRW'
+    cyberrock_iot_checkstatus = 'https://iot-api.sandbox.sandgrain.io/api/iot/checkAuthStatus'
+    cyberrock_iot_immediateauth = 'https://iot-api.sandbox.sandgrain.io/api/iot/immediateAuth'
+    cyberrock_iot_requestRWtransactionid = 'https://iot-api.sandbox.sandgrain.io/api/iot/requestTransactionID'
+    cyberrock_iot_requestRW = 'https://iot-api.sandbox.sandgrain.io/api/iot/requestRW'
+    cyberrock_iot_requestRWstatus = 'https://iot-api.sandbox.sandgrain.io/api/iot/checkRequestRWStatus'
+    cyberrock_tenant_login = 'https://tenant-api.sandbox.sandgrain.io/api/auth/tenantUserLogin'
+    cyberrock_tenant_claimid = 'https://tenant-api.sandbox.sandgrain.io/api/tenantApi/claimId'
+
+# SPI Configuration (if using SPI interface)
+API_CS1 = 22  # GPIO22
+API_CS2 = 27  # GPIO27
+API_CS3 = 17  # GPIO17
+
+# Command definitions
+l_command_ident = [0x01, 0x00, 0x00, 0x00]
+l_command_bist = [0x80, 0x00, 0x00, 0x00]
+l_command_cr = [0x03, 0x00, 0x08, 0x00]
+l_command_cr_ek = [0x07, 0x00, 0x08, 0x00]
+
+# Response indices
+API_I_IDENT_PART1_START = 5
+API_I_IDENT_PART1_LENGTH = 16
+API_I_IDENT_PART2_START = 21
+API_I_IDENT_PART2_LENGTH = 16
+API_I_IDENT_START = 5
+API_I_IDENT_LENGTH = 32
+API_I_CHAL_START = 38
+API_I_CHAL_LENGTH = 32
+API_I_RESP_START = 71
+API_I_RESP_LENGTH = 16
+API_I_EK_START = 87
+API_I_EK_LENGTH = 16
+API_I_BIST = 71
+
+# ==================== DEVICE POOL ====================
 class DeviceConfig:
     def __init__(self, device_id, serial_port):
         self.device_id = device_id
         self.serial_port = serial_port
         self.lock = threading.Lock()
         self.last_operation_time = 0
-        self.is_busy = False
 
 class DevicePool:
-    def __init__(self):
-        self.devices = []
-        self.current_index = 0
-        self.pool_lock = threading.Lock()
-        
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance.devices = []
+                    cls._instance.current_index = 0
+                    cls._instance.initialized = False
+        return cls._instance
+    
     def initialize(self):
-        ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
-        for idx, port in enumerate(ports):
-            try:
-                ser = serial.Serial(port, 115200, timeout=0.5)
-                ser.close()
-                time.sleep(0.05)
-                device = DeviceConfig(device_id=idx, serial_port=port)
-                self.devices.append(device)
-                print(f"✓ Device {idx}: {port}")
-            except:
-                pass
+        if self.initialized:
+            return True
+        
+        if interface == 'USB':
+            ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
+            for idx, port in enumerate(ports):
+                try:
+                    ser = serial.Serial(port, 115200, timeout=0.5)
+                    ser.close()
+                    time.sleep(0.05)
+                    device = DeviceConfig(device_id=idx, serial_port=port)
+                    self.devices.append(device)
+                    print(f"[SGA] Device {idx}: {port}")
+                except:
+                    pass
+        
+        self.initialized = True
+        print(f"[SGA] Initialized {len(self.devices)} device(s)")
         return len(self.devices) > 0
     
     def get_device(self):
-        with self.pool_lock:
-            if not self.devices:
-                return None
-            for _ in range(len(self.devices)):
-                device = self.devices[self.current_index]
-                self.current_index = (self.current_index + 1) % len(self.devices)
-                if not device.is_busy:
-                    return device
-            return self.devices[self.current_index]
+        if not self.devices:
+            raise Exception("No devices available")
+        
+        with self._lock:
+            device = self.devices[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.devices)
+            return device
 
-device_pool = DevicePool()
+_device_pool = DevicePool()
 
-# ------------------ Optimized Serial Communication ------------------
+# ==================== SERIAL COMMUNICATION (OPTIMIZED) ====================
 @contextmanager
 def safe_serial(device):
+    """Context manager for safe serial communication"""
     ser = None
     try:
-        # Enforce minimum time between operations
         elapsed = time.time() - device.last_operation_time
-        if elapsed < 0.2:
-            time.sleep(0.2 - elapsed)
+        if elapsed < 0.15:
+            time.sleep(0.15 - elapsed)
         
         ser = serial.Serial(
             port=device.serial_port,
             baudrate=115200,
-            timeout=2.5,
-            write_timeout=2.5,
+            timeout=2.0,
+            write_timeout=2.0,
             exclusive=True
         )
-        time.sleep(0.1)
+        
+        time.sleep(0.08)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
+        
         yield ser
+        
     finally:
         if ser and ser.is_open:
             try:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
                 ser.close()
             except:
                 pass
         device.last_operation_time = time.time()
-        time.sleep(0.1)
+        time.sleep(0.08)
 
-def do_serial_transfer(device, command_list, max_retries=3):
-    for attempt in range(max_retries):
-        with device.lock:
-            device.is_busy = True
-            try:
-                with safe_serial(device) as ser:
-                    # Send
-                    cmd = ''.join('%02x' % e for e in command_list) + "\r"
-                    ser.write(cmd.encode('utf-8'))
-                    ser.flush()
-                    
-                    # CRITICAL: Wait for device to process
-                    time.sleep(0.15)
-                    
-                    # Read
-                    response = b''
-                    start = time.time()
-                    while time.time() - start < 2.5:
-                        if ser.in_waiting > 0:
-                            chunk = ser.read(ser.in_waiting)
-                            if len(chunk) > 0:
-                                response += chunk
-                                if len(response) >= 144:
-                                    break
-                        else:
-                            time.sleep(0.02)
-                    
-                    if len(response) == 0:
-                        raise Exception("No data received")
-                    
-                    result = [int(response[i:i+2], 16) for i in range(0, len(response)-1, 2)]
-                    return result
-                    
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise Exception(f"Failed after {max_retries} attempts: {e}")
-                time.sleep(0.3 * (attempt + 1))
-            finally:
-                device.is_busy = False
-
-# ------------------ Import SandGrain modules ------------------
-sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
-try:
-    import sga
-    import SandGrain_Credentials as credentials
-except ImportError:
-    print("Modules not found, using mock implementations")
-
-    class MockSGA:
-        def get_pccid(self):
-            device = device_pool.get_device()
-            if not device:
-                return "mock_pccid_no_device"
-            # Use optimized function
-            cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
-            result = do_serial_transfer(device, cmd)
-            pcc = ''.join('%02x' % e for e in result[5:21])
-            id_part = ''.join('%02x' % e for e in result[21:37])
-            return pcc + id_part
-
-        def do_cyberrock_iot_login(self, tokens, username, password):
-            return "mock_token", "mock_iotid"
-
-        def get_cyberrock_cw(self, tokens, accesstoken, pccid, request_sig):
-            return "mock_cw_abcdef", "mock_transaction_id"
-
-        def do_rw_only(self, cw_list):
-            device = device_pool.get_device()
-            if not device:
-                return "mock_rw_no_device"
-            # Use optimized function
-            cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
-            result = do_serial_transfer(device, cmd)
-            rw = ''.join('%02x' % e for e in result[71:87])
-            return rw
-
-        def do_submit_rw(self, tokens, accesstoken, pccid, cw, rw, transactionid, request_sig):
-            return "mock_response_transaction_id"
-
-        def do_retrieve_result(self, tokens, accesstoken, transactionid, request_sig):
-            return "AUTH_OK", "mock_claim_id"
-
-    sga = MockSGA()
-
-    class MockCredentials:
-        cloudflaretokens = {'CF-Access-Client-Id': 'test', 'CF-Access-Client-Secret': 'test'}
-        iotusername = 'test'
-        iotpassword = 'test'
-
-    credentials = MockCredentials()
-
-# ------------------ Patch sga to use optimized serial ------------------
-original_get_pccid = getattr(sga, 'get_pccid', None)
-original_do_rw_only = getattr(sga, 'do_rw_only', None)
-
-if original_get_pccid and not isinstance(sga, type(lambda: None)):
-    def optimized_get_pccid():
-        device = device_pool.get_device()
-        if not device:
-            raise Exception("No devices available")
-        cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
-        result = do_serial_transfer(device, cmd)
-        pcc = ''.join('%02x' % e for e in result[5:21])
-        id_part = ''.join('%02x' % e for e in result[21:37])
-        return pcc + id_part
+def do_ser_transfer_l(l):
+    """Optimized serial transfer using device pool"""
+    if not _device_pool.initialized:
+        _device_pool.initialize()
     
-    sga.get_pccid = optimized_get_pccid
-
-if original_do_rw_only and not isinstance(sga, type(lambda: None)):
-    def optimized_do_rw_only(cw_list):
-        device = device_pool.get_device()
-        if not device:
-            raise Exception("No devices available")
-        cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
-        result = do_serial_transfer(device, cmd)
-        rw = ''.join('%02x' % e for e in result[71:87])
-        return rw
+    device = _device_pool.get_device()
     
-    sga.do_rw_only = optimized_do_rw_only
+    with device.lock:
+        with safe_serial(device) as ser:
+            # Send
+            l_s = ''.join('%02x' % e for e in l) + "\r"
+            ser.write(l_s.encode('utf-8'))
+            ser.flush()
+            
+            # CRITICAL: Wait for device
+            time.sleep(0.12)
+            
+            # Read
+            resp_s = b''
+            start = time.time()
+            last_data = start
+            
+            while time.time() - start < 2.0:
+                if ser.in_waiting > 0:
+                    chunk = ser.read(ser.in_waiting)
+                    if len(chunk) > 0:
+                        resp_s += chunk
+                        last_data = time.time()
+                        if len(resp_s) >= 144:
+                            break
+                else:
+                    if len(resp_s) > 0 and (time.time() - last_data) > 0.3:
+                        break
+                    time.sleep(0.01)
+            
+            if len(resp_s) == 0:
+                raise Exception("No data received")
+            
+            l_r = [int(resp_s[i:i+2], 16) for i in range(0, len(resp_s)-1, 2)]
+            return l_r
 
-# ------------------ Flask App ------------------
-app = Flask(__name__)
-CORS(app)
+# ==================== SPI COMMUNICATION (ORIGINAL) ====================
+if interface == 'SPI':
+    import spidev
+    
+    def spi_open():
+        spi = spidev.SpiDev(0, 0)
+        spi.max_speed_hz = 10_000_000
+        return spi
+    
+    def spi_close(spi):
+        if spi:
+            spi.close()
+    
+    def do_spi_transfer_l(l):
+        GPIO.output(API_CS1, GPIO.LOW)
+        spi = spi_open()
+        l_r = spi.xfer(l)
+        spi_close(spi)
+        GPIO.output(API_CS1, GPIO.HIGH)
+        return l_r
+    
+    def gpio_setup():
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(API_CS1, GPIO.OUT)
+        GPIO.setup(API_CS2, GPIO.OUT)
+        GPIO.setup(API_CS3, GPIO.OUT)
+        GPIO.output(API_CS1, GPIO.HIGH)
+        GPIO.output(API_CS2, GPIO.HIGH)
+        GPIO.output(API_CS3, GPIO.HIGH)
 
-# ------------------ GPIO / LED Setup ------------------
+# Set the transfer function based on interface
+if interface == 'SPI':
+    do_transfer_l = do_spi_transfer_l
+if interface == 'USB':
+    do_transfer_l = do_ser_transfer_l
+
+# ==================== HELPER FUNCTIONS ====================
+def list_invert(l):
+    """Invert list (bitwise NOT)"""
+    return [(~e) & 0xFF for e in l]
+
+def intToList(number):
+    """Convert integer to byte list"""
+    L1 = log(number, 256)
+    L2 = ceil(L1)
+    if L1 == L2:
+        L2 += 1
+    return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
+
+# ==================== COMMAND ASSEMBLY ====================
+def assemble_bist_l():
+    return l_command_bist + [0]*68
+
+def assemble_id_l():
+    return l_command_ident + [0] + [0]*32
+
+def assemble_cw_l(l_challenge):
+    return l_command_cr + [0] + l_challenge + [0] + [0]*49
+
+def assemble_ek_l(l_challenge):
+    return l_command_cr_ek + [0] + l_challenge + [0] + [0]*65
+
+# ==================== RESPONSE DISASSEMBLY ====================
+def disassemble_l_bist(l_r):
+    l_pcc_s = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
+    l_id_s = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
+    l_rw_s = l_r[38:54]
+    l_ek_s = l_r[54:70]
+    i_pass = l_r[API_I_BIST]
+    b_pass = 1 if i_pass == 0x50 else 0
+    return b_pass, l_pcc_s, l_id_s, l_rw_s, l_ek_s
+
+def disassemble_l_id(l_r):
+    l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
+    l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
+    return l_pcc, l_id
+
+def disassemble_l_rw(l_r):
+    l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
+    l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
+    l_rw = l_r[API_I_RESP_START : API_I_RESP_START + API_I_RESP_LENGTH]
+    return l_pcc, l_id, l_rw
+
+def disassemble_l_ek(l_r):
+    l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
+    l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
+    l_ek = l_r[API_I_EK_START : API_I_EK_START + API_I_EK_LENGTH]
+    return l_pcc, l_id, l_ek
+
+def disassemble_l_rwek(l_r):
+    l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
+    l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
+    l_rw = l_r[API_I_RESP_START : API_I_RESP_START + API_I_RESP_LENGTH]
+    l_ek = l_r[API_I_EK_START : API_I_EK_START + API_I_EK_LENGTH]
+    return l_pcc, l_id, l_rw, l_ek
+
+# ==================== DEVICE OPERATIONS ====================
+def do_bist():
+    l_r = do_transfer_l(assemble_bist_l())
+    b_pass, l_pcc_s, l_id_s, l_rw_s, l_ek_s = disassemble_l_bist(l_r)
+    return b_pass, l_pcc_s, l_id_s, l_rw_s, l_ek_s
+
+def do_id(l_pccid_s):
+    l_r = do_transfer_l(assemble_id_l())
+    l_pcc, l_id = disassemble_l_id(l_r)
+    l_pccid = l_pcc + l_id
+    b_pass_id = 1 if l_pccid == l_pccid_s else 0
+    return b_pass_id, l_pcc, l_id
+
+def do_rw(l_pccid, l_rw_s):
+    l_r = do_transfer_l(assemble_cw_l(l_pccid))
+    l_pcc, l_id, l_rw = disassemble_l_rw(l_r)
+    b_pass_rw = 1 if l_rw == l_rw_s else 0
+    return b_pass_rw, l_pcc, l_id, l_rw
+
+def do_ek(l_pccid_bar, l_ek_s):
+    l_r = do_transfer_l(assemble_ek_l(l_pccid_bar))
+    l_pcc, l_id, l_ek = disassemble_l_ek(l_r)
+    b_pass_ek = 1 if l_ek == l_ek_s else 0
+    return b_pass_ek, l_pcc, l_id, l_ek
+
+def get_pccid():
+    """Get PCCID from device"""
+    l_r = do_transfer_l(assemble_id_l())
+    l_pcc, l_id = disassemble_l_id(l_r)
+    s_pcc = ''.join('%02x' % e for e in l_pcc)
+    s_id = ''.join('%02x' % e for e in l_id)
+    return s_pcc + s_id
+
+def do_rw_only(cw_l):
+    """Get RW from device given CW"""
+    l_r = do_transfer_l(assemble_cw_l(cw_l))
+    l_pcc, l_id, l_rw = disassemble_l_rw(l_r)
+    s_rw = ''.join('%02x' % e for e in l_rw)
+    return s_rw
+
+def do_rw_ek(cw_l):
+    """Get RW and EK from device"""
+    l_r = do_transfer_l(assemble_ek_l(cw_l))
+    l_pcc, l_id, l_rw, l_ek = disassemble_l_rwek(l_r)
+    s_rw = ''.join('%02x' % e for e in l_rw)
+    s_ek = ''.join('%02x' % e for e in l_ek)
+    return s_rw, s_ek
+
+# ==================== CYBERROCK API FUNCTIONS ====================
+def do_cyberrock_iot_login(cloudflaretokens, iotusername, iotpassword):
+    response = requests.post(cyberrock_iot_login,
+        headers=cloudflaretokens,
+        data={'username': iotusername, 'password': iotpassword},
+        timeout=10)
+    logindata = response.json()
+    return logindata['accessToken'], logindata['iotId']
+
+def get_cyberrock_cw(cloudflaretokens, accesstoken, PCCID, requestSignature):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"requestSignedResponse": requestSignature, "PCCID": PCCID}
+    response = requests.post(cyberrock_iot_requestcw,
+        headers=data_auth, json=data_post, timeout=10)
+    cwdata = response.json()
+    return cwdata['CW'], cwdata['transactionId']
+
+def do_submit_rw(cloudflaretokens, accesstoken, PCCID, CW, RW, transactionid, requestSignature):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {
+        "requestSignedResponse": requestSignature,
+        "PCCID": PCCID,
+        "CW": CW,
+        "RW": RW,
+        "transactionId": transactionid
+    }
+    response = requests.post(cyberrock_iot_replyrw,
+        headers=data_auth, json=data_post, timeout=10)
+    return response.json()['transactionId']
+
+def do_retrieve_result(cloudflaretokens, accesstoken, transactionid, requestSignature):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    params_post = {"transactionId": transactionid}
+    data_post = {"requestSignedResponse": requestSignature}
+    
+    authenticationresult = 'NOT_READY'
+    max_attempts = 30
+    attempt = 0
+    
+    while authenticationresult == 'NOT_READY' and attempt < max_attempts:
+        time.sleep(0.2)
+        response = requests.get(cyberrock_iot_checkstatus,
+            headers=data_auth, params=params_post, json=data_post, timeout=10)
+        responsedata = response.json()
+        authenticationresult = responsedata['status']
+        attempt += 1
+    
+    claimid = responsedata.get('claimId', '') if authenticationresult == 'CLAIM_ID' else ''
+    return authenticationresult, claimid
+
+def do_immediate_auth(cloudflaretokens, accesstoken, PCCID, CW, RW):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"PCCID": PCCID, "CW": CW, "RW": RW}
+    response = requests.post(cyberrock_iot_immediateauth,
+        headers=data_auth, data=data_post, timeout=10)
+    responsedata = response.json()
+    return responsedata['status']
+
+def do_request_rw_transactionid(cloudflaretokens, accesstoken, PCCID, CW):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"PCCID": PCCID, "CW": CW}
+    response = requests.post(cyberrock_iot_requestRWtransactionid,
+        headers=data_auth, data=data_post, timeout=10)
+    tiddata = response.json()
+    return tiddata['transactionId']
+
+def do_request_rw(cloudflaretokens, accesstoken, PCCID, CW, transactionid):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"PCCID": PCCID, "CW": CW, "transactionId": transactionid}
+    response = requests.post(cyberrock_iot_requestRW,
+        headers=data_auth, data=data_post, timeout=10)
+    tiddata = response.json()
+    return tiddata['rwTransactionId']
+
+def do_request_rw_status(cloudflaretokens, accesstoken, RWtransactionID):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    result = 'NOT_READY'
+    max_attempts = 30
+    attempt = 0
+    
+    while result == 'NOT_READY' and attempt < max_attempts:
+        time.sleep(0.2)
+        response = requests.get(cyberrock_iot_requestRWstatus,
+            headers=data_auth, params={"rwTransactionId": RWtransactionID}, timeout=10)
+        responsedata = response.json()
+        result = responsedata['status']
+        attempt += 1
+    
+    rw = responsedata.get('RW', '') if result == 'GENERATED_RW' else ''
+    return result, rw
+
+def do_cyberrock_tenant_login(cloudflaretokens, tenantusername, tenantpassword):
+    response = requests.post(cyberrock_tenant_login,
+        headers=cloudflaretokens,
+        data={'email': tenantusername, 'password': tenantpassword},
+        timeout=10)
+    logindata = response.json()
+    return logindata['accessToken']
+
+def do_cyberrock_tenant_claimid(cloudflaretokens, tenantaccesstoken, claimid):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + tenantaccesstoken}
+    response = requests.post(cyberrock_tenant_claimid,
+        headers=data_auth, data={'claimId': claimid}, timeout=10)
+    responsedata = response.json()
+    return responsedata['result']
+
+def get_cyberrock_cw_ek(cloudflaretokens, accesstoken, PCCID):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"PCCID": PCCID}
+    response = requests.post(cyberrock_iot_requestcwek,
+        headers=data_auth, data=data_post, timeout=10)
+    cwdata = response.json()
+    return cwdata['CW'], cwdata['transactionId']
+
+def do_submit_rw_ek(cloudflaretokens, accesstoken, PCCID, CW, RW, transactionid):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    data_post = {"PCCID": PCCID, "CW": CW, "RW": RW, "transactionId": transactionid}
+    response = requests.post(cyberrock_iot_replyrwek,
+        headers=data_auth, data=data_post, timeout=10)
+    cwdata = response.json()
+    return cwdata['transactionId']
+
+def do_retrieve_result_ek(cloudflaretokens, accesstoken, transactionid):
+    data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
+    authenticationresult = 'NOT_READY'
+    max_attempts = 30
+    attempt = 0
+    
+    while authenticationresult == 'NOT_READY' and attempt < max_attempts:
+        time.sleep(0.2)
+        response = requests.get(cyberrock_iot_checkstatusek,
+            headers=data_auth,
+            params={'transactionId': transactionid, "requestSignedResponse": "True"},
+            timeout=10)
+        responsedata = response.json()
+        authenticationresult = responsedata['status']
+        attempt += 1
+    
+    ekresult = responsedata.get('ek', '')
+    claimid = responsedata.get('claimId', '') if authenticationresult == 'CLAIM_ID' else ''
+    return authenticationresult, claimid, ekresult
+
+# ==================== INITIALIZATION ====================
 def gpio_setup():
     try:
-        import RPi.GPIO as GPIO
         GPIO.setmode(GPIO.BCM)
-        GPIO.setup(5, GPIO.OUT)   # Green
-        GPIO.setup(6, GPIO.OUT)   # Red
-        GPIO.setup(12, GPIO.OUT)  # Yellow
-        GPIO.output(5, GPIO.LOW)
-        GPIO.output(6, GPIO.LOW)
-        GPIO.output(12, GPIO.HIGH)
-        return GPIO
-    except ImportError:
-        print("GPIO not available - running in mock mode")
-        return None
+        GPIO.setwarnings(False)
+        if interface == 'SPI':
+            GPIO.setup(API_CS1, GPIO.OUT)
+            GPIO.setup(API_CS2, GPIO.OUT)
+            GPIO.setup(API_CS3, GPIO.OUT)
+            GPIO.output(API_CS1, GPIO.HIGH)
+            GPIO.output(API_CS2, GPIO.HIGH)
+            GPIO.output(API_CS3, GPIO.HIGH)
+    except:
+        pass
 
-GPIO = gpio_setup()
-
-def set_led_status(status):
-    if GPIO:
-        if status == 'green':
-            GPIO.output(5, GPIO.HIGH)
-            GPIO.output(6, GPIO.LOW)
-            GPIO.output(12, GPIO.LOW)
-        elif status == 'red':
-            GPIO.output(5, GPIO.LOW)
-            GPIO.output(6, GPIO.HIGH)
-            GPIO.output(12, GPIO.LOW)
-        elif status == 'yellow':
-            GPIO.output(5, GPIO.LOW)
-            GPIO.output(6, GPIO.LOW)
-            GPIO.output(12, GPIO.HIGH)
-    else:
-        print(f"Mock LED status: {status}")
-
-# ------------------ Logic Functions ------------------
-def status_logic():
-    return {
-        "status": "ok",
-        "message": "Raspberry Pi API is running",
-        "devices_available": len(device_pool.devices)
-    }
-
-def get_identity_logic():
-    set_led_status('yellow')
-    try:
-        identity = sga.get_pccid()
-        set_led_status('green')
-        return {"success": True, "identity": identity}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
-
-def get_cw_logic(identity):
-    set_led_status('yellow')
-    try:
-        if not identity:
-            raise ValueError("Identity is required")
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens,
-            credentials.iotusername,
-            credentials.iotpassword
-        )
-        cw, transactionId = sga.get_cyberrock_cw(
-            credentials.cloudflaretokens,
-            iotaccesstoken,
-            identity,
-            False
-        )
-        set_led_status('green')
-        return {"success": True, "cw": cw, "transactionId": transactionId}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
-
-def get_rw_logic(cw):
-    set_led_status('yellow')
-    try:
-        if not cw:
-            raise ValueError("CW is required")
-
-        from math import log, ceil
-        def intToList(number):
-            L1 = log(number, 256)
-            L2 = ceil(L1)
-            if L1 == L2:
-                L2 += 1
-            return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
-
-        cw_int = int(cw, 16)
-        cw_list = intToList(cw_int)
-        rw = sga.do_rw_only(cw_list)
-        set_led_status('green')
-        return {"success": True, "rw": rw}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
-
-def authenticate_logic(identity, cw, rw, transactionId):
-    set_led_status('yellow')
-    try:
-        if not all([identity, cw, rw, transactionId]):
-            raise ValueError("All parameters required")
-
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
-        )
-        sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transactionId, False)
-        auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transactionId, False)
-        set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
-        return {"success": auth_result in ['CLAIM_ID', 'AUTH_OK'], "authResult": auth_result, "claimId": claim_id}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
-
-# ------------------ Flask Endpoints ------------------
-@app.route('/api/status', methods=['GET'])
-def api_status():
-    return jsonify(status_logic())
-
-@app.route('/api/get-identity', methods=['GET'])
-def get_identity():
-    return jsonify(get_identity_logic())
-
-@app.route('/api/get-cw', methods=['POST'])
-def get_cw():
-    data = request.get_json()
-    return jsonify(get_cw_logic(data.get('identity')))
-
-@app.route('/api/get-rw', methods=['POST'])
-def get_rw():
-    data = request.get_json()
-    return jsonify(get_rw_logic(data.get('cw')))
-
-@app.route('/api/authenticate', methods=['POST'])
-def authenticate():
-    data = request.get_json()
-    return jsonify(authenticate_logic(
-        data.get('identity'),
-        data.get('cw'),
-        data.get('rw'),
-        data.get('transactionId')
-    ))
-
-# ------------------ MQTT Integration ------------------
-DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
-BROKER = "3.67.46.166"
-
-def on_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT broker with result code {rc}")
-    client.subscribe(f"pi/{DEVICE_ID}/command")
-
-def on_message(client, userdata, msg):
-    try:
-        payload = json.loads(msg.payload.decode())
-        function_name = payload.get("functionName")
-        args = payload.get("args", [])
-
-        if function_name == "status":
-            response = status_logic()
-        elif function_name == "get_identity":
-            response = get_identity_logic()
-        elif function_name == "get_cw":
-            identity = args[0].get("identity") if args else None
-            response = get_cw_logic(identity)
-        elif function_name == "get_rw":
-            cw = args[0].get("cw") if args else None
-            response = get_rw_logic(cw)
-        elif function_name == "authenticate":
-            params = args[0] if args else {}
-            response = authenticate_logic(
-                params.get("identity"),
-                params.get("cw"),
-                params.get("rw"),
-                params.get("transactionId")
-            )
-        else:
-            response = {"success": False, "error": f"Function {function_name} not found"}
-
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(response))
-        print(f"Sent MQTT response: {response}")
-    except Exception as e:
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False, "error": str(e)}))
-        print(f"MQTT error: {e}")
-
-def run_mqtt():
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect(BROKER, 1883, 60)
-    client.loop_forever()
-
-# Start MQTT in a separate thread
-threading.Thread(target=run_mqtt, daemon=True).start()
-
-# ------------------ Run Flask ------------------
-if __name__ == "__main__":
-    print("="*60)
-    print("Starting Pi API Server with MQTT...")
-    print("="*60)
-    
-    # Initialize device pool
-    print("\nInitializing devices...")
-    if device_pool.initialize():
-        print(f"✓ {len(device_pool.devices)} device(s) ready")
-    else:
-        print("⚠ WARNING: No devices found!")
-    
-    print("\nStarting server on port 8000...")
-    print("="*60)
-    
-    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
+gpio_setup()
+print(f"[SGA] Module loaded - Environment: {environment}, Interface: {interface}")
