@@ -1,16 +1,18 @@
 import json
 import threading
+import time
 import paho.mqtt.client as mqtt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import sys
 import os
 from dotenv import load_dotenv
+from queue import Queue
+import uuid
 
 load_dotenv()
 
 # ------------------ Import SandGrain modules ------------------
-
 try:
     import sga
     import SandGrain_Credentials as credentials
@@ -43,117 +45,148 @@ GPIO = gpio_setup()
 
 def set_led_status(status):
     if GPIO:
-        if status == 'green':
-            GPIO.output(5, GPIO.HIGH)
-            GPIO.output(6, GPIO.LOW)
-            GPIO.output(12, GPIO.LOW)
-        elif status == 'red':
-            GPIO.output(5, GPIO.LOW)
-            GPIO.output(6, GPIO.HIGH)
-            GPIO.output(12, GPIO.LOW)
-        elif status == 'yellow':
-            GPIO.output(5, GPIO.LOW)
-            GPIO.output(6, GPIO.LOW)
-            GPIO.output(12, GPIO.HIGH)
+        GPIO.output(5, status == "green")
+        GPIO.output(6, status == "red")
+        GPIO.output(12, status == "yellow")
     else:
         print(f"Mock LED status: {status}")
 
-# ------------------ Logic Functions ------------------
+# ------------------ SERIAL COMMAND QUEUE (CRITICAL FIX) ------------------
+command_queue = Queue()
+response_map = {}
+
+def serial_worker():
+    while True:
+        job_id, fn, payload = command_queue.get()
+        try:
+            if fn == "status":
+                result = status_logic()
+            elif fn == "get_identity":
+                result = get_identity_logic()
+            elif fn == "get_cw":
+                result = get_cw_logic(payload["identity"])
+            elif fn == "get_rw":
+                result = get_rw_logic(payload["cw"])
+            elif fn == "authenticate":
+                result = authenticate_logic(
+                    payload["identity"],
+                    payload["cw"],
+                    payload["rw"],
+                    payload["transactionId"]
+                )
+            else:
+                result = {"success": False, "error": "Unknown function"}
+        except Exception as e:
+            result = {"success": False, "error": str(e)}
+
+        response_map[job_id] = result
+        command_queue.task_done()
+
+# Start ONE serial worker only
+threading.Thread(target=serial_worker, daemon=True).start()
+
+# ------------------ Logic Functions (UNCHANGED) ------------------
 def status_logic():
     return {"status": "ok", "message": "Raspberry Pi API is running"}
 
 def get_identity_logic():
     set_led_status('yellow')
-    try:
-        identity = sga.get_pccid()
-        set_led_status('green')
-        return {"success": True, "identity": identity}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
+    identity = sga.get_pccid()
+    set_led_status('green')
+    return {"success": True, "identity": identity}
 
 def get_cw_logic(identity):
+    if not identity:
+        raise ValueError("Identity is required")
+
     set_led_status('yellow')
-    try:
-        if not identity:
-            raise ValueError("Identity is required")
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens,
-            credentials.iotusername,
-            credentials.iotpassword
-        )
-        cw, transactionId = sga.get_cyberrock_cw(
-            credentials.cloudflaretokens,
-            iotaccesstoken,
-            identity,
-            False
-        )
-        set_led_status('green')
-        return {"success": True, "cw": cw, "transactionId": transactionId}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
+    iotaccesstoken, _ = sga.do_cyberrock_iot_login(
+        credentials.cloudflaretokens,
+        credentials.iotusername,
+        credentials.iotpassword
+    )
+    cw, transactionId = sga.get_cyberrock_cw(
+        credentials.cloudflaretokens,
+        iotaccesstoken,
+        identity,
+        False
+    )
+    set_led_status('green')
+    return {"success": True, "cw": cw, "transactionId": transactionId}
 
 def get_rw_logic(cw):
-    set_led_status('yellow')
-    try:
-        if not cw:
-            raise ValueError("CW is required")
+    if not cw:
+        raise ValueError("CW is required")
 
-        cw_int = int(cw, 16)
-        cw_list = sga.intToList(cw_int)
-        rw = sga.do_rw_only(cw_list)
-        set_led_status('green')
-        return {"success": True, "rw": rw}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
+    set_led_status('yellow')
+    cw_int = int(cw, 16)
+    rw = sga.do_rw_only(sga.intToList(cw_int))
+    set_led_status('green')
+    return {"success": True, "rw": rw}
 
 def authenticate_logic(identity, cw, rw, transactionId):
-    set_led_status('yellow')
-    try:
-        if not all([identity, cw, rw, transactionId]):
-            raise ValueError("All parameters required")
+    if not all([identity, cw, rw, transactionId]):
+        raise ValueError("All parameters required")
 
-        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
-            credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
-        )
-        sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transactionId, False)
-        auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transactionId, False)
-        set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
-        return {"success": auth_result in ['CLAIM_ID', 'AUTH_OK'], "authResult": auth_result, "claimId": claim_id}
-    except Exception as e:
-        set_led_status('red')
-        return {"success": False, "error": str(e)}
+    set_led_status('yellow')
+    iotaccesstoken, _ = sga.do_cyberrock_iot_login(
+        credentials.cloudflaretokens,
+        credentials.iotusername,
+        credentials.iotpassword
+    )
+    sga.do_submit_rw(
+        credentials.cloudflaretokens,
+        iotaccesstoken,
+        identity,
+        cw,
+        rw,
+        transactionId,
+        False
+    )
+    auth_result, claim_id = sga.do_retrieve_result(
+        credentials.cloudflaretokens,
+        iotaccesstoken,
+        transactionId,
+        False
+    )
+    set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
+    return {
+        "success": auth_result in ['CLAIM_ID', 'AUTH_OK'],
+        "authResult": auth_result,
+        "claimId": claim_id
+    }
+
+# ------------------ Helper to enqueue calls ------------------
+def enqueue_call(fn, payload):
+    job_id = str(uuid.uuid4())
+    command_queue.put((job_id, fn, payload))
+    while job_id not in response_map:
+        time.sleep(0.01)
+    return response_map.pop(job_id)
 
 # ------------------ Flask Endpoints ------------------
 @app.route('/api/status', methods=['GET'])
 def api_status():
-    return jsonify(status_logic())
+    return jsonify(enqueue_call("status", {}))
 
 @app.route('/api/get-identity', methods=['GET'])
-def get_identity():
-    return jsonify(get_identity_logic())
+def api_get_identity():
+    return jsonify(enqueue_call("get_identity", {}))
 
 @app.route('/api/get-cw', methods=['POST'])
-def get_cw():
+def api_get_cw():
     data = request.get_json()
-    return jsonify(get_cw_logic(data.get('identity')))
+    return jsonify(enqueue_call("get_cw", {"identity": data.get("identity")}))
 
 @app.route('/api/get-rw', methods=['POST'])
-def get_rw():
+def api_get_rw():
     data = request.get_json()
-    return jsonify(get_rw_logic(data.get('cw')))
+    return jsonify(enqueue_call("get_rw", {"cw": data.get("cw")}))
 
 @app.route('/api/authenticate', methods=['POST'])
-def authenticate():
+def api_authenticate():
     data = request.get_json()
-    return jsonify(authenticate_logic(
-        data.get('identity'),
-        data.get('cw'),
-        data.get('rw'),
-        data.get('transactionId')
-    ))
+    return jsonify(enqueue_call("authenticate", data))
 
 # ------------------ MQTT Integration ------------------
 DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
@@ -166,35 +199,15 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
-        function_name = payload.get("functionName")
-        args = payload.get("args", [])
-
-        if function_name == "status":
-            response = status_logic()
-        elif function_name == "get_identity":
-            response = get_identity_logic()
-        elif function_name == "get_cw":
-            identity = args[0].get("identity") if args else None
-            response = get_cw_logic(identity)
-        elif function_name == "get_rw":
-            cw = args[0].get("cw") if args else None
-            response = get_rw_logic(cw)
-        elif function_name == "authenticate":
-            params = args[0] if args else {}
-            response = authenticate_logic(
-                params.get("identity"),
-                params.get("cw"),
-                params.get("rw"),
-                params.get("transactionId")
-            )
-        else:
-            response = {"success": False, "error": f"Function {function_name} not found"}
-
+        fn = payload.get("functionName")
+        args = payload.get("args", [{}])
+        response = enqueue_call(fn, args[0])
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps(response))
-        print(f"Sent MQTT response: {response}")
     except Exception as e:
-        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False, "error": str(e)}))
-        print(f"MQTT error: {e}")
+        client.publish(
+            f"pi/{DEVICE_ID}/response",
+            json.dumps({"success": False, "error": str(e)})
+        )
 
 def run_mqtt():
     client = mqtt.Client()
@@ -203,12 +216,11 @@ def run_mqtt():
     client.connect(BROKER, 1883, 60)
     client.loop_forever()
 
-# Start MQTT in a separate thread
 threading.Thread(target=run_mqtt, daemon=True).start()
 
 # ------------------ Run Flask ------------------
 if __name__ == "__main__":
-    print("="*60)
-    print("Starting Pi API Server with MQTT...")
-    print("="*60)
+    print("=" * 60)
+    print("Starting Pi API Server with SERIAL QUEUE + MQTT")
+    print("=" * 60)
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
