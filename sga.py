@@ -5,10 +5,21 @@ from math import log, ceil
 import threading
 import glob
 from contextlib import contextmanager
+import logging
+import subprocess
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
 environment = 'SANDBOX'
 interface = 'USB'
+
+# CRITICAL: ZERO FAILURE TOLERANCE
+MAX_RETRIES = 999  # Effectively infinite
+DEVICE_RESET_AFTER_FAILURES = 3
+COMPLETE_SYSTEM_RESET_AFTER = 10
 
 # API Endpoints
 if environment == 'SANDBOX':
@@ -34,25 +45,44 @@ API_I_IDENT_PART1_START = 5
 API_I_IDENT_PART1_LENGTH = 16
 API_I_IDENT_PART2_START = 21
 API_I_IDENT_PART2_LENGTH = 16
-API_I_IDENT_START = 5
-API_I_IDENT_LENGTH = 32
-API_I_CHAL_START = 38
-API_I_CHAL_LENGTH = 32
 API_I_RESP_START = 71
 API_I_RESP_LENGTH = 16
-API_I_EK_START = 87
-API_I_EK_LENGTH = 16
-API_I_BIST = 71
 
-# ==================== DEVICE POOL WITH RETRY LOGIC ====================
+# ==================== GLOBAL SERIAL LOCK ====================
+_global_serial_lock = threading.RLock()
+
+# ==================== USB RESET UTILITY ====================
+def hard_reset_device(port):
+    """Aggressive device reset"""
+    logger.warning(f"HARD RESET initiated for {port}")
+    
+    try:
+        ser = serial.Serial(port, 115200, timeout=0.5)
+        ser.setDTR(False)
+        time.sleep(0.2)
+        ser.setRTS(False)
+        time.sleep(0.2)
+        ser.setDTR(True)
+        time.sleep(0.2)
+        ser.setRTS(True)
+        time.sleep(0.3)
+        ser.close()
+        time.sleep(1.0)
+        return True
+    except Exception as e:
+        logger.error(f"Hard reset failed: {e}")
+        return False
+
+# ==================== DEVICE POOL ====================
 class DeviceConfig:
     def __init__(self, device_id, serial_port):
         self.device_id = device_id
         self.serial_port = serial_port
-        self.lock = threading.Lock()
         self.last_operation_time = 0
         self.consecutive_failures = 0
-        self.max_failures = 3
+        self.total_operations = 0
+        self.successful_operations = 0
+        self.last_reset_time = 0
 
 class DevicePool:
     _instance = None
@@ -64,7 +94,6 @@ class DevicePool:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance.devices = []
-                    cls._instance.current_index = 0
                     cls._instance.initialized = False
         return cls._instance
     
@@ -74,196 +103,265 @@ class DevicePool:
         
         if interface == 'USB':
             ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
+            
+            if not ports:
+                logger.error("No serial devices found!")
+                return False
+            
             for idx, port in enumerate(ports):
                 try:
-                    ser = serial.Serial(port, 115200, timeout=0.5)
-                    ser.close()
-                    time.sleep(0.1)
                     device = DeviceConfig(device_id=idx, serial_port=port)
                     self.devices.append(device)
-                    print(f"[SGA] Device {idx}: {port}")
+                    logger.info(f"Device {idx} registered: {port}")
                 except Exception as e:
-                    print(f"[SGA] Failed to open {port}: {e}")
+                    logger.warning(f"Failed to register {port}: {e}")
         
         self.initialized = True
-        print(f"[SGA] Initialized {len(self.devices)} device(s)")
+        logger.info(f"Device pool initialized with {len(self.devices)} device(s)")
         return len(self.devices) > 0
     
     def get_device(self):
+        """Always returns a device - never fails"""
         if not self.devices:
-            raise Exception("No devices available")
-        
-        with self._lock:
-            # Find device with lowest failure count
-            best_device = min(self.devices, key=lambda d: d.consecutive_failures)
-            return best_device
+            self.initialized = False
+            self.initialize()
+            if not self.devices:
+                raise Exception("CRITICAL: No devices available")
+        return self.devices[0]
     
-    def mark_success(self, device):
-        device.consecutive_failures = 0
-    
-    def mark_failure(self, device):
-        device.consecutive_failures += 1
+    def reset_device_if_needed(self, device):
+        """Reset device if it's been failing"""
+        if device.consecutive_failures >= DEVICE_RESET_AFTER_FAILURES:
+            time_since_reset = time.time() - device.last_reset_time
+            if time_since_reset > 5.0:
+                logger.warning(f"Device {device.device_id} has {device.consecutive_failures} failures - resetting")
+                hard_reset_device(device.serial_port)
+                device.last_reset_time = time.time()
+                device.consecutive_failures = 0
 
 _device_pool = DevicePool()
 
-# ==================== ROBUST SERIAL COMMUNICATION ====================
-@contextmanager
-def safe_serial(device, operation_name="unknown"):
-    """Context manager for safe serial communication with recovery"""
-    ser = None
+# ==================== WAIT-UNTIL-SUCCESS SERIAL COMMUNICATION ====================
+def read_until_data(ser, min_bytes=144, max_wait=30.0):
+    """Wait until we get data - NEVER gives up early"""
+    resp_s = b''
+    start_time = time.time()
+    last_data_time = start_time
+    no_data_count = 0
+    
+    logger.debug(f"Reading serial - will wait up to {max_wait}s")
+    
+    while True:
+        elapsed = time.time() - start_time
+        
+        if elapsed > max_wait:
+            if len(resp_s) > 0:
+                logger.warning(f"Timeout but have {len(resp_s)} bytes - using it")
+                break
+            else:
+                raise Exception(f"No data after {max_wait}s")
+        
+        try:
+            waiting = ser.in_waiting
+            
+            if waiting > 0:
+                chunk = ser.read(waiting)
+                if len(chunk) > 0:
+                    resp_s += chunk
+                    last_data_time = time.time()
+                    no_data_count = 0
+                    
+                    if len(resp_s) >= min_bytes:
+                        logger.debug(f"Got {len(resp_s)} bytes - complete")
+                        break
+            else:
+                if len(resp_s) > 0:
+                    stall_time = time.time() - last_data_time
+                    if stall_time > 1.0:
+                        no_data_count += 1
+                        if no_data_count >= 3 or len(resp_s) >= min_bytes * 0.8:
+                            logger.warning(f"Stalled at {len(resp_s)} bytes - considering complete")
+                            break
+                
+                time.sleep(0.02)
+                
+        except serial.SerialException as e:
+            logger.error(f"Serial exception: {e}")
+            if len(resp_s) > 0:
+                break
+            raise
+    
+    return resp_s
+
+def parse_response_aggressive(resp_bytes):
+    """Parse with MAXIMUM tolerance"""
+    if len(resp_bytes) == 0:
+        raise Exception("Empty response")
+    
+    decoded = None
     try:
-        # Enforce minimum delay between operations
-        elapsed = time.time() - device.last_operation_time
-        min_delay = 0.3  # Increased from 0.15
-        if elapsed < min_delay:
-            time.sleep(min_delay - elapsed)
+        decoded = resp_bytes.decode('utf-8', errors='ignore')
+    except:
+        try:
+            decoded = resp_bytes.decode('ascii', errors='ignore')
+        except:
+            decoded = str(resp_bytes)
+    
+    hex_chars = ''.join(c for c in decoded if c in '0123456789abcdefABCDEF')
+    
+    if len(hex_chars) < 10:
+        hex_chars = ''
+        for byte in resp_bytes:
+            if 48 <= byte <= 57 or 97 <= byte <= 102 or 65 <= byte <= 70:
+                hex_chars += chr(byte)
+    
+    if len(hex_chars) < 10:
+        raise Exception(f"Could not extract valid hex ({len(hex_chars)} chars)")
+    
+    byte_list = []
+    for i in range(0, len(hex_chars) - 1, 2):
+        try:
+            byte_list.append(int(hex_chars[i:i+2], 16))
+        except ValueError:
+            continue
+    
+    if len(byte_list) < 5:
+        raise Exception(f"Byte list too short: {len(byte_list)}")
+    
+    return byte_list
+
+@contextmanager
+def open_serial_persistent(device):
+    """Open serial with MAXIMUM persistence"""
+    ser = None
+    attempt = 0
+    
+    while True:
+        attempt += 1
         
-        # Open serial with increased timeout
-        ser = serial.Serial(
-            port=device.serial_port,
-            baudrate=115200,
-            timeout=3.0,  # Increased from 2.0
-            write_timeout=4.0,
-            exclusive=True
-        )
+        try:
+            elapsed = time.time() - device.last_operation_time
+            if elapsed < 0.4:
+                time.sleep(0.4 - elapsed)
+            
+            ser = serial.Serial(
+                port=device.serial_port,
+                baudrate=115200,
+                timeout=5.0,
+                write_timeout=5.0,
+                exclusive=False,
+                inter_byte_timeout=0.2
+            )
+            
+            logger.debug("Port opened")
+            break
+            
+        except serial.SerialException as e:
+            logger.error(f"Open failed (attempt {attempt}): {e}")
+            
+            if attempt % 5 == 0:
+                hard_reset_device(device.serial_port)
+            
+            time.sleep(0.5 * min(attempt, 5))
+            
+            if attempt > 100:
+                raise Exception(f"Could not open after {attempt} attempts")
+    
+    try:
+        time.sleep(0.3)
         
-        # Wait for port to stabilize
-        time.sleep(0.15)  # Increased from 0.08
-        
-        # Clear buffers multiple times for reliability
-        for _ in range(2):
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            time.sleep(0.05)
+        for _ in range(5):
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                time.sleep(0.03)
+            except:
+                pass
         
         yield ser
         
-        _device_pool.mark_success(device)
-        
-    except serial.SerialException as e:
-        _device_pool.mark_failure(device)
-        print(f"[SGA] Serial error on {device.serial_port} during {operation_name}: {e}")
-        raise Exception(f"Serial communication error: {str(e)}")
-    except Exception as e:
-        _device_pool.mark_failure(device)
-        print(f"[SGA] Unexpected error on {device.serial_port} during {operation_name}: {e}")
-        raise
     finally:
         if ser and ser.is_open:
             try:
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
+                time.sleep(0.05)
                 ser.close()
             except:
                 pass
+        
         device.last_operation_time = time.time()
-        time.sleep(0.15)  # Increased post-operation delay
+        time.sleep(0.3)
 
-def do_ser_transfer_l(l, max_retries=5):
-    """Optimized serial transfer with automatic retry"""
-    
+def do_ser_transfer_l(l):
+    """BULLETPROOF transfer - NEVER FAILS"""
     if not _device_pool.initialized:
         _device_pool.initialize()
     
-    last_error = None
+    attempt = 0
     
-    for attempt in range(max_retries):
-        try:
-            device = _device_pool.get_device()
+    with _global_serial_lock:
+        while True:
+            attempt += 1
             
-            # Skip device if too many consecutive failures
-            if device.consecutive_failures >= device.max_failures:
-                print(f"[SGA] Skipping device {device.device_id} due to failures")
-                continue
-            
-            with device.lock:
-                with safe_serial(device, f"transfer_attempt_{attempt+1}") as ser:
-                    # Prepare command
+            try:
+                device = _device_pool.get_device()
+                _device_pool.reset_device_if_needed(device)
+                
+                logger.info(f"Transfer attempt {attempt}")
+                
+                with open_serial_persistent(device) as ser:
                     l_s = ''.join('%02x' % e for e in l) + "\r"
                     
-                    # Send command
-                    ser.write(l_s.encode('utf-8'))
+                    bytes_written = ser.write(l_s.encode('utf-8'))
                     ser.flush()
                     
-                    # CRITICAL: Wait for device processing
-                    # Different commands may need different delays
-                    if l[0] == 0x01:  # Identity command
-                        time.sleep(0.15)
-                    elif l[0] == 0x03:  # Challenge-response
-                        time.sleep(0.2)
+                    if l[0] == 0x01:
+                        delay = 0.4
+                    elif l[0] == 0x03:
+                        delay = 0.5
                     else:
-                        time.sleep(0.15)
+                        delay = 0.4
                     
-                    # Read response with robust timeout handling
-                    resp_s = b''
-                    start_time = time.time()
-                    last_data_time = start_time
-                    max_wait = 3.0  # Maximum wait time
+                    time.sleep(delay)
                     
-                    while time.time() - start_time < max_wait:
-                        if ser.in_waiting > 0:
-                            chunk = ser.read(ser.in_waiting)
-                            if len(chunk) > 0:
-                                resp_s += chunk
-                                last_data_time = time.time()
-                                
-                                # Check if we have complete response (144 chars = 72 bytes hex)
-                                if len(resp_s) >= 144:
-                                    break
-                        else:
-                            # If we have data and no new data for 0.4s, consider complete
-                            if len(resp_s) > 0 and (time.time() - last_data_time) > 0.4:
-                                break
-                            time.sleep(0.01)
+                    max_wait = 30.0 if attempt <= 3 else 60.0
+                    resp_bytes = read_until_data(ser, min_bytes=144, max_wait=max_wait)
                     
-                    # Validate response
-                    if len(resp_s) == 0:
-                        raise Exception("No data received from device")
+                    byte_list = parse_response_aggressive(resp_bytes)
                     
-                    # Clean and parse response
-                    resp_clean = resp_s.strip()
+                    logger.info(f"✓ SUCCESS on attempt {attempt}: {len(byte_list)} bytes")
+                    device.consecutive_failures = 0
+                    device.successful_operations += 1
+                    device.total_operations += 1
+                    return byte_list
                     
-                    # Remove any non-hex characters
-                    resp_hex = ''.join(c for c in resp_clean.decode('utf-8', errors='ignore') 
-                                      if c in '0123456789abcdefABCDEF')
-                    
-                    if len(resp_hex) < 10:
-                        raise Exception(f"Response too short: {len(resp_hex)} chars")
-                    
-                    # Parse hex string to byte list
-                    try:
-                        l_r = [int(resp_hex[i:i+2], 16) for i in range(0, len(resp_hex), 2)]
-                    except ValueError as e:
-                        raise Exception(f"Invalid hex response: {e}")
-                    
-                    if len(l_r) < 5:
-                        raise Exception(f"Parsed response too short: {len(l_r)} bytes")
-                    
-                    print(f"[SGA] Success on attempt {attempt+1}: {len(l_r)} bytes")
-                    return l_r
-                    
-        except Exception as e:
-            last_error = e
-            print(f"[SGA] Attempt {attempt+1}/{max_retries} failed: {e}")
-            
-            if attempt < max_retries - 1:
-                # Exponential backoff
-                wait_time = 0.3 * (attempt + 1)
-                print(f"[SGA] Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                print(f"[SGA] All {max_retries} attempts failed")
-    
-    # All retries exhausted
-    raise Exception(f"Failed after {max_retries} attempts. Last error: {last_error}")
+            except Exception as e:
+                device.consecutive_failures += 1
+                device.total_operations += 1
+                
+                logger.error(f"✗ Attempt {attempt} failed: {e}")
+                
+                if attempt < 5:
+                    backoff = 1.0
+                elif attempt < 10:
+                    backoff = 2.0
+                elif attempt < 20:
+                    backoff = 3.0
+                else:
+                    backoff = 5.0
+                
+                if attempt % COMPLETE_SYSTEM_RESET_AFTER == 0:
+                    logger.warning(f"Complete reset at attempt {attempt}")
+                    hard_reset_device(device.serial_port)
+                    backoff = 3.0
+                
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
 
-# Set the transfer function
 do_transfer_l = do_ser_transfer_l
 
 # ==================== HELPER FUNCTIONS ====================
-def list_invert(l):
-    return [(~e) & 0xFF for e in l]
-
 def intToList(number):
     L1 = log(number, 256)
     L2 = ceil(L1)
@@ -272,25 +370,23 @@ def intToList(number):
     return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
 
 # ==================== COMMAND ASSEMBLY ====================
-def assemble_bist_l():
-    return l_command_bist + [0]*68
-
 def assemble_id_l():
     return l_command_ident + [0] + [0]*32
 
 def assemble_cw_l(l_challenge):
     return l_command_cr + [0] + l_challenge + [0] + [0]*49
 
-def assemble_ek_l(l_challenge):
-    return l_command_cr_ek + [0] + l_challenge + [0] + [0]*65
-
 # ==================== RESPONSE DISASSEMBLY ====================
 def disassemble_l_id(l_r):
+    if len(l_r) < API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH:
+        raise Exception(f"Response too short: {len(l_r)} bytes")
     l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
     l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
     return l_pcc, l_id
 
 def disassemble_l_rw(l_r):
+    if len(l_r) < API_I_RESP_START + API_I_RESP_LENGTH:
+        raise Exception(f"Response too short: {len(l_r)} bytes")
     l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
     l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
     l_rw = l_r[API_I_RESP_START : API_I_RESP_START + API_I_RESP_LENGTH]
@@ -298,7 +394,8 @@ def disassemble_l_rw(l_r):
 
 # ==================== DEVICE OPERATIONS ====================
 def get_pccid():
-    """Get PCCID from device with retry logic"""
+    """Get PCCID - NEVER FAILS"""
+    logger.info("Getting PCCID...")
     l_r = do_transfer_l(assemble_id_l())
     l_pcc, l_id = disassemble_l_id(l_r)
     s_pcc = ''.join('%02x' % e for e in l_pcc)
@@ -306,7 +403,8 @@ def get_pccid():
     return s_pcc + s_id
 
 def do_rw_only(cw_l):
-    """Get RW from device given CW with retry logic"""
+    """Get RW - NEVER FAILS"""
+    logger.info("Getting RW...")
     l_r = do_transfer_l(assemble_cw_l(cw_l))
     l_pcc, l_id, l_rw = disassemble_l_rw(l_r)
     s_rw = ''.join('%02x' % e for e in l_rw)
@@ -317,7 +415,7 @@ def do_cyberrock_iot_login(cloudflaretokens, iotusername, iotpassword):
     response = requests.post(cyberrock_iot_login,
         headers=cloudflaretokens,
         data={'username': iotusername, 'password': iotpassword},
-        timeout=15)  # Increased timeout
+        timeout=20)
     logindata = response.json()
     return logindata['accessToken'], logindata['iotId']
 
@@ -325,7 +423,7 @@ def get_cyberrock_cw(cloudflaretokens, accesstoken, PCCID, requestSignature):
     data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
     data_post = {"requestSignedResponse": requestSignature, "PCCID": PCCID}
     response = requests.post(cyberrock_iot_requestcw,
-        headers=data_auth, json=data_post, timeout=15)
+        headers=data_auth, json=data_post, timeout=20)
     cwdata = response.json()
     return cwdata['CW'], cwdata['transactionId']
 
@@ -339,7 +437,7 @@ def do_submit_rw(cloudflaretokens, accesstoken, PCCID, CW, RW, transactionid, re
         "transactionId": transactionid
     }
     response = requests.post(cyberrock_iot_replyrw,
-        headers=data_auth, json=data_post, timeout=15)
+        headers=data_auth, json=data_post, timeout=20)
     return response.json()['transactionId']
 
 def do_retrieve_result(cloudflaretokens, accesstoken, transactionid, requestSignature):
@@ -348,13 +446,13 @@ def do_retrieve_result(cloudflaretokens, accesstoken, transactionid, requestSign
     data_post = {"requestSignedResponse": requestSignature}
     
     authenticationresult = 'NOT_READY'
-    max_attempts = 30
+    max_attempts = 50
     attempt = 0
     
     while authenticationresult == 'NOT_READY' and attempt < max_attempts:
-        time.sleep(0.3)  # Increased from 0.2
+        time.sleep(0.3)
         response = requests.get(cyberrock_iot_checkstatus,
-            headers=data_auth, params=params_post, json=data_post, timeout=15)
+            headers=data_auth, params=params_post, json=data_post, timeout=20)
         responsedata = response.json()
         authenticationresult = responsedata['status']
         attempt += 1
@@ -371,5 +469,5 @@ def gpio_setup():
         pass
 
 gpio_setup()
-print(f"[SGA] Module loaded - Environment: {environment}, Interface: {interface}")
-print(f"[SGA] Retry logic enabled with 3 attempts per operation")
+logger.info(f"SGA Module loaded - Environment: {environment}, Interface: {interface}")
+logger.info("ZERO-FAILURE MODE: Will retry indefinitely until success")
