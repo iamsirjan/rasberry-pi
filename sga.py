@@ -194,8 +194,24 @@ def do_ser_transfer_l(l):
             if len(resp_s) == 0:
                 raise Exception("No data received")
             
-            l_r = [int(resp_s[i:i+2], 16) for i in range(0, len(resp_s)-1, 2)]
-            return l_r
+            # DEBUG: Print raw response
+            print(f"[DEBUG] Raw response length: {len(resp_s)}")
+            print(f"[DEBUG] Raw response (first 100 chars): {resp_s[:100]}")
+            
+            # Parse hex response - strip whitespace and newlines
+            resp_clean = resp_s.strip()
+            
+            # Check if response is already hex string or needs conversion
+            try:
+                # Try parsing as hex string
+                l_r = [int(resp_clean[i:i+2], 16) for i in range(0, len(resp_clean), 2)]
+                print(f"[DEBUG] Parsed {len(l_r)} bytes")
+                print(f"[DEBUG] First 10 bytes: {l_r[:10]}")
+                return l_r
+            except (ValueError, IndexError) as e:
+                print(f"[DEBUG] Parse error: {e}")
+                print(f"[DEBUG] Response content: {resp_clean}")
+                raise Exception(f"Failed to parse response: {e}")
 
 # ==================== SPI COMMUNICATION (ORIGINAL) ====================
 if interface == 'SPI':
