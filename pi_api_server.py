@@ -6,206 +6,18 @@ from flask_cors import CORS
 import sys
 import os
 from dotenv import load_dotenv
-import time
-import serial
-import glob
-from contextlib import contextmanager
 
 load_dotenv()
-
-# ------------------ Device Pool for Multi-Device Support ------------------
-class DeviceConfig:
-    def __init__(self, device_id, serial_port):
-        self.device_id = device_id
-        self.serial_port = serial_port
-        self.lock = threading.Lock()
-        self.last_operation_time = 0
-        self.is_busy = False
-
-class DevicePool:
-    def __init__(self):
-        self.devices = []
-        self.current_index = 0
-        self.pool_lock = threading.Lock()
-        
-    def initialize(self):
-        ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
-        for idx, port in enumerate(ports):
-            try:
-                ser = serial.Serial(port, 115200, timeout=0.5)
-                ser.close()
-                time.sleep(0.05)
-                device = DeviceConfig(device_id=idx, serial_port=port)
-                self.devices.append(device)
-                print(f"✓ Device {idx}: {port}")
-            except:
-                pass
-        return len(self.devices) > 0
-    
-    def get_device(self):
-        with self.pool_lock:
-            if not self.devices:
-                return None
-            for _ in range(len(self.devices)):
-                device = self.devices[self.current_index]
-                self.current_index = (self.current_index + 1) % len(self.devices)
-                if not device.is_busy:
-                    return device
-            return self.devices[self.current_index]
-
-device_pool = DevicePool()
-
-# ------------------ Optimized Serial Communication ------------------
-@contextmanager
-def safe_serial(device):
-    ser = None
-    try:
-        # Enforce minimum time between operations
-        elapsed = time.time() - device.last_operation_time
-        if elapsed < 0.2:
-            time.sleep(0.2 - elapsed)
-        
-        ser = serial.Serial(
-            port=device.serial_port,
-            baudrate=115200,
-            timeout=2.5,
-            write_timeout=2.5,
-            exclusive=True
-        )
-        time.sleep(0.1)
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-        yield ser
-    finally:
-        if ser and ser.is_open:
-            try:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-                ser.close()
-            except:
-                pass
-        device.last_operation_time = time.time()
-        time.sleep(0.1)
-
-def do_serial_transfer(device, command_list, max_retries=3):
-    for attempt in range(max_retries):
-        with device.lock:
-            device.is_busy = True
-            try:
-                with safe_serial(device) as ser:
-                    # Send
-                    cmd = ''.join('%02x' % e for e in command_list) + "\r"
-                    ser.write(cmd.encode('utf-8'))
-                    ser.flush()
-                    
-                    # CRITICAL: Wait for device to process
-                    time.sleep(0.15)
-                    
-                    # Read
-                    response = b''
-                    start = time.time()
-                    while time.time() - start < 2.5:
-                        if ser.in_waiting > 0:
-                            chunk = ser.read(ser.in_waiting)
-                            if len(chunk) > 0:
-                                response += chunk
-                                if len(response) >= 144:
-                                    break
-                        else:
-                            time.sleep(0.02)
-                    
-                    if len(response) == 0:
-                        raise Exception("No data received")
-                    
-                    result = [int(response[i:i+2], 16) for i in range(0, len(response)-1, 2)]
-                    return result
-                    
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise Exception(f"Failed after {max_retries} attempts: {e}")
-                time.sleep(0.3 * (attempt + 1))
-            finally:
-                device.is_busy = False
 
 # ------------------ Import SandGrain modules ------------------
 sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
 try:
     import sga
     import SandGrain_Credentials as credentials
-except ImportError:
-    print("Modules not found, using mock implementations")
-
-    class MockSGA:
-        def get_pccid(self):
-            device = device_pool.get_device()
-            if not device:
-                return "mock_pccid_no_device"
-            # Use optimized function
-            cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
-            result = do_serial_transfer(device, cmd)
-            pcc = ''.join('%02x' % e for e in result[5:21])
-            id_part = ''.join('%02x' % e for e in result[21:37])
-            return pcc + id_part
-
-        def do_cyberrock_iot_login(self, tokens, username, password):
-            return "mock_token", "mock_iotid"
-
-        def get_cyberrock_cw(self, tokens, accesstoken, pccid, request_sig):
-            return "mock_cw_abcdef", "mock_transaction_id"
-
-        def do_rw_only(self, cw_list):
-            device = device_pool.get_device()
-            if not device:
-                return "mock_rw_no_device"
-            # Use optimized function
-            cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
-            result = do_serial_transfer(device, cmd)
-            rw = ''.join('%02x' % e for e in result[71:87])
-            return rw
-
-        def do_submit_rw(self, tokens, accesstoken, pccid, cw, rw, transactionid, request_sig):
-            return "mock_response_transaction_id"
-
-        def do_retrieve_result(self, tokens, accesstoken, transactionid, request_sig):
-            return "AUTH_OK", "mock_claim_id"
-
-    sga = MockSGA()
-
-    class MockCredentials:
-        cloudflaretokens = {'CF-Access-Client-Id': 'test', 'CF-Access-Client-Secret': 'test'}
-        iotusername = 'test'
-        iotpassword = 'test'
-
-    credentials = MockCredentials()
-
-# ------------------ Patch sga to use optimized serial ------------------
-original_get_pccid = getattr(sga, 'get_pccid', None)
-original_do_rw_only = getattr(sga, 'do_rw_only', None)
-
-if original_get_pccid and not isinstance(sga, type(lambda: None)):
-    def optimized_get_pccid():
-        device = device_pool.get_device()
-        if not device:
-            raise Exception("No devices available")
-        cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
-        result = do_serial_transfer(device, cmd)
-        pcc = ''.join('%02x' % e for e in result[5:21])
-        id_part = ''.join('%02x' % e for e in result[21:37])
-        return pcc + id_part
-    
-    sga.get_pccid = optimized_get_pccid
-
-if original_do_rw_only and not isinstance(sga, type(lambda: None)):
-    def optimized_do_rw_only(cw_list):
-        device = device_pool.get_device()
-        if not device:
-            raise Exception("No devices available")
-        cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
-        result = do_serial_transfer(device, cmd)
-        rw = ''.join('%02x' % e for e in result[71:87])
-        return rw
-    
-    sga.do_rw_only = optimized_do_rw_only
+    print("✓ SGA module loaded successfully")
+except ImportError as e:
+    print(f"✗ Failed to import modules: {e}")
+    sys.exit(1)
 
 # ------------------ Flask App ------------------
 app = Flask(__name__)
@@ -248,11 +60,7 @@ def set_led_status(status):
 
 # ------------------ Logic Functions ------------------
 def status_logic():
-    return {
-        "status": "ok",
-        "message": "Raspberry Pi API is running",
-        "devices_available": len(device_pool.devices)
-    }
+    return {"status": "ok", "message": "Raspberry Pi API is running"}
 
 def get_identity_logic():
     set_led_status('yellow')
@@ -292,16 +100,8 @@ def get_rw_logic(cw):
         if not cw:
             raise ValueError("CW is required")
 
-        from math import log, ceil
-        def intToList(number):
-            L1 = log(number, 256)
-            L2 = ceil(L1)
-            if L1 == L2:
-                L2 += 1
-            return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
-
         cw_int = int(cw, 16)
-        cw_list = intToList(cw_int)
+        cw_list = sga.intToList(cw_int)
         rw = sga.do_rw_only(cw_list)
         set_led_status('green')
         return {"success": True, "rw": rw}
@@ -411,15 +211,4 @@ if __name__ == "__main__":
     print("="*60)
     print("Starting Pi API Server with MQTT...")
     print("="*60)
-    
-    # Initialize device pool
-    print("\nInitializing devices...")
-    if device_pool.initialize():
-        print(f"✓ {len(device_pool.devices)} device(s) ready")
-    else:
-        print("⚠ WARNING: No devices found!")
-    
-    print("\nStarting server on port 8000...")
-    print("="*60)
-    
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
