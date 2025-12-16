@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ------------------ Import SandGrain modules ------------------
-sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
+
 try:
     import sga
     import SandGrain_Credentials as credentials
