@@ -1,377 +1,425 @@
-import random, sys, time, requests
-import spidev, serial
-import RPi.GPIO as GPIO
-from periphery import SPI
-from functools import reduce
-from math import log, ceil
+import json
 import threading
+import paho.mqtt.client as mqtt
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import sys
+import os
+from dotenv import load_dotenv
+import time
+import serial
 import glob
-import queue
 from contextlib import contextmanager
 
-# Device configuration class
+load_dotenv()
+
+# ------------------ Device Pool for Multi-Device Support ------------------
 class DeviceConfig:
-    def __init__(self, device_id, interface='USB', serial_port=None, cs_pin=None):
+    def __init__(self, device_id, serial_port):
         self.device_id = device_id
-        self.interface = interface
         self.serial_port = serial_port
-        self.cs_pin = cs_pin
         self.lock = threading.Lock()
+        self.last_operation_time = 0
         self.is_busy = False
-        
-# Auto-detect available serial ports
-def detect_serial_ports():
-    """Detect all available USB serial ports"""
-    ports = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
-    return sorted(ports)
 
-# Initialize multiple devices
-def initialize_devices(num_devices=None, interface='USB'):
-    """Initialize multiple device configurations"""
-    devices = []
-    
-    if interface == 'USB':
-        ports = detect_serial_ports()
-        if num_devices:
-            ports = ports[:num_devices]
+class DevicePool:
+    def __init__(self):
+        self.devices = []
+        self.current_index = 0
+        self.pool_lock = threading.Lock()
         
-        print(f"Found {len(ports)} serial ports: {ports}")
-        
+    def initialize(self):
+        ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
         for idx, port in enumerate(ports):
-            device = DeviceConfig(
-                device_id=idx,
-                interface='USB',
-                serial_port=port
-            )
-            devices.append(device)
-            print(f"Device {idx}: {port}")
+            try:
+                ser = serial.Serial(port, 115200, timeout=0.5)
+                ser.close()
+                time.sleep(0.05)
+                device = DeviceConfig(device_id=idx, serial_port=port)
+                self.devices.append(device)
+                print(f"✓ Device {idx}: {port}")
+            except:
+                pass
+        return len(self.devices) > 0
     
-    elif interface == 'SPI':
-        cs_pins = [22, 27, 17]  # GPIO22, GPIO27, GPIO17
-        if num_devices:
-            cs_pins = cs_pins[:num_devices]
-        
-        for idx, cs_pin in enumerate(cs_pins):
-            device = DeviceConfig(
-                device_id=idx,
-                interface='SPI',
-                cs_pin=cs_pin
-            )
-            devices.append(device)
-            GPIO.setup(cs_pin, GPIO.OUT)
-            GPIO.output(cs_pin, GPIO.HIGH)
-            print(f"Device {idx}: CS Pin {cs_pin}")
-    
-    return devices
+    def get_device(self):
+        with self.pool_lock:
+            if not self.devices:
+                return None
+            for _ in range(len(self.devices)):
+                device = self.devices[self.current_index]
+                self.current_index = (self.current_index + 1) % len(self.devices)
+                if not device.is_busy:
+                    return device
+            return self.devices[self.current_index]
 
-# Context manager for serial port
+device_pool = DevicePool()
+
+# ------------------ Optimized Serial Communication ------------------
 @contextmanager
-def serial_connection(device, timeout=2.0):
-    """Context manager for safe serial port handling"""
+def safe_serial(device):
     ser = None
     try:
+        # Enforce minimum time between operations
+        elapsed = time.time() - device.last_operation_time
+        if elapsed < 0.2:
+            time.sleep(0.2 - elapsed)
+        
         ser = serial.Serial(
-            device.serial_port,
-            115200,
-            timeout=timeout,
-            write_timeout=timeout,
-            inter_byte_timeout=0.1
+            port=device.serial_port,
+            baudrate=115200,
+            timeout=2.5,
+            write_timeout=2.5,
+            exclusive=True
         )
-        # Give device time to initialize
-        time.sleep(0.05)
-        # Flush buffers
+        time.sleep(0.1)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
         yield ser
-    except serial.SerialException as e:
-        print(f"[Device {device.device_id}] Serial error on {device.serial_port}: {e}")
-        raise
     finally:
         if ser and ser.is_open:
             try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
                 ser.close()
             except:
                 pass
+        device.last_operation_time = time.time()
+        time.sleep(0.1)
 
-def do_ser_transfer_l(device, l, max_retries=3):
-    """Thread-safe serial transfer with timeout and retry"""
-    
+def do_serial_transfer(device, command_list, max_retries=3):
     for attempt in range(max_retries):
         with device.lock:
+            device.is_busy = True
             try:
-                device.is_busy = True
-                
-                with serial_connection(device, timeout=2.0) as ser:
-                    # Send command
-                    l_s = ''.join('%02x' % e for e in l) + "\r"
-                    bytes_written = ser.write(l_s.encode('utf-8'))
+                with safe_serial(device) as ser:
+                    # Send
+                    cmd = ''.join('%02x' % e for e in command_list) + "\r"
+                    ser.write(cmd.encode('utf-8'))
                     ser.flush()
                     
-                    # Wait briefly for device to process
-                    time.sleep(0.05)
+                    # CRITICAL: Wait for device to process
+                    time.sleep(0.15)
                     
-                    # Read response with timeout
-                    resp_s = b''
-                    start_time = time.time()
-                    timeout = 2.0
-                    
-                    while time.time() - start_time < timeout:
+                    # Read
+                    response = b''
+                    start = time.time()
+                    while time.time() - start < 2.5:
                         if ser.in_waiting > 0:
                             chunk = ser.read(ser.in_waiting)
-                            resp_s += chunk
-                            # Check if we got a complete response (should end with data)
-                            if len(resp_s) >= 10:  # Minimum expected response size
-                                break
+                            if len(chunk) > 0:
+                                response += chunk
+                                if len(response) >= 144:
+                                    break
                         else:
-                            time.sleep(0.01)
+                            time.sleep(0.02)
                     
-                    if len(resp_s) == 0:
-                        raise Exception(f"No data received (attempt {attempt + 1}/{max_retries})")
+                    if len(response) == 0:
+                        raise Exception("No data received")
                     
-                    # Parse response
-                    try:
-                        l_r = [int(resp_s[i:i+2], 16) for i in range(0, len(resp_s)-1, 2)]
-                    except ValueError as e:
-                        raise Exception(f"Invalid response format: {resp_s[:20]}")
-                    
-                    print(f"[Device {device.device_id}] Transfer successful ({len(l_r)} bytes)")
-                    return l_r
+                    result = [int(response[i:i+2], 16) for i in range(0, len(response)-1, 2)]
+                    return result
                     
             except Exception as e:
-                print(f"[Device {device.device_id}] Attempt {attempt + 1}/{max_retries} failed: {e}")
                 if attempt == max_retries - 1:
-                    raise
-                time.sleep(0.2)  # Wait before retry
+                    raise Exception(f"Failed after {max_retries} attempts: {e}")
+                time.sleep(0.3 * (attempt + 1))
             finally:
                 device.is_busy = False
-                time.sleep(0.1)  # Small delay between operations
 
-def spi_open():
-    spi = spidev.SpiDev(0, 0)
-    spi.max_speed_hz = 10_000_000
-    return spi
+# ------------------ Import SandGrain modules ------------------
+sys.path.insert(1, '/home/pi/SandGrain/SandGrainSuite_USB/')
+try:
+    import sga
+    import SandGrain_Credentials as credentials
+except ImportError:
+    print("Modules not found, using mock implementations")
 
-def spi_close(spi):
-    if spi:
-        spi.close()
+    class MockSGA:
+        def get_pccid(self):
+            device = device_pool.get_device()
+            if not device:
+                return "mock_pccid_no_device"
+            # Use optimized function
+            cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
+            result = do_serial_transfer(device, cmd)
+            pcc = ''.join('%02x' % e for e in result[5:21])
+            id_part = ''.join('%02x' % e for e in result[21:37])
+            return pcc + id_part
 
-def do_spi_transfer_l(device, l, max_retries=3):
-    """Thread-safe SPI transfer with retry"""
-    
-    for attempt in range(max_retries):
-        with device.lock:
-            spi = None
-            try:
-                device.is_busy = True
-                GPIO.output(device.cs_pin, GPIO.LOW)
-                time.sleep(0.01)
-                
-                spi = spi_open()
-                l_r = spi.xfer(l)
-                
-                print(f"[Device {device.device_id}] Transfer successful")
-                return l_r
-                
-            except Exception as e:
-                print(f"[Device {device.device_id}] Attempt {attempt + 1}/{max_retries} failed: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                time.sleep(0.1)
-            finally:
-                if spi:
-                    spi_close(spi)
-                GPIO.output(device.cs_pin, GPIO.HIGH)
-                device.is_busy = False
-                time.sleep(0.05)
+        def do_cyberrock_iot_login(self, tokens, username, password):
+            return "mock_token", "mock_iotid"
 
-def do_transfer_l(device, l):
-    """Perform transfer based on device interface type"""
-    if device.interface == 'SPI':
-        return do_spi_transfer_l(device, l)
-    elif device.interface == 'USB':
-        return do_ser_transfer_l(device, l)
-    else:
-        raise ValueError(f"Unknown interface: {device.interface}")
+        def get_cyberrock_cw(self, tokens, accesstoken, pccid, request_sig):
+            return "mock_cw_abcdef", "mock_transaction_id"
 
-# Command assembly functions (from original code)
-def assemble_id_l():
-    return [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
+        def do_rw_only(self, cw_list):
+            device = device_pool.get_device()
+            if not device:
+                return "mock_rw_no_device"
+            # Use optimized function
+            cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
+            result = do_serial_transfer(device, cmd)
+            rw = ''.join('%02x' % e for e in result[71:87])
+            return rw
 
-def assemble_cw_l(l_challenge):
-    return [0x03, 0x00, 0x08, 0x00] + [0] + l_challenge + [0] + [0]*49
+        def do_submit_rw(self, tokens, accesstoken, pccid, cw, rw, transactionid, request_sig):
+            return "mock_response_transaction_id"
 
-def assemble_ek_l(l_challenge):
-    return [0x07, 0x00, 0x08, 0x00] + [0] + l_challenge + [0] + [0]*65
+        def do_retrieve_result(self, tokens, accesstoken, transactionid, request_sig):
+            return "AUTH_OK", "mock_claim_id"
 
-# Get PCCID for specific device
-def get_pccid(device):
-    """Get PCCID for specific device"""
-    print(f"[Device {device.device_id}] Getting PCCID...")
-    
-    l = assemble_id_l()
-    l_r = do_transfer_l(device, l)
-    
-    l_pcc = l_r[5:21]
-    l_id = l_r[21:37]
-    
-    s_pcc = ''.join('%02x' % e for e in l_pcc)
-    s_id = ''.join('%02x' % e for e in l_id)
-    s_pcc_id = s_pcc + s_id
-    
-    print(f"[Device {device.device_id}] PCCID: {s_pcc_id}")
-    return s_pcc_id
+    sga = MockSGA()
 
-def get_rw_only(device, cw_l):
-    """Get RW response from device"""
-    print(f"[Device {device.device_id}] Getting RW...")
-    
-    l = assemble_cw_l(cw_l)
-    l_r = do_transfer_l(device, l)
-    
-    l_rw = l_r[71:87]
-    s_rw = ''.join('%02x' % e for e in l_rw)
-    
-    print(f"[Device {device.device_id}] RW: {s_rw}")
-    return s_rw
+    class MockCredentials:
+        cloudflaretokens = {'CF-Access-Client-Id': 'test', 'CF-Access-Client-Secret': 'test'}
+        iotusername = 'test'
+        iotpassword = 'test'
 
-# Worker function for queue-based processing
-def device_worker(device, task_queue, result_queue):
-    """Worker thread that processes tasks from queue"""
-    print(f"[Device {device.device_id}] Worker started")
-    
-    while True:
-        try:
-            task = task_queue.get(timeout=1.0)
-            
-            if task is None:  # Poison pill to stop worker
-                print(f"[Device {device.device_id}] Worker stopping")
-                break
-            
-            task_id, func, args = task
-            
-            try:
-                print(f"[Device {device.device_id}] Starting task {task_id}")
-                result = func(device, *args)
-                result_queue.put((device.device_id, task_id, True, result))
-                print(f"[Device {device.device_id}] Task {task_id} completed")
-            except Exception as e:
-                print(f"[Device {device.device_id}] Task {task_id} failed: {e}")
-                result_queue.put((device.device_id, task_id, False, str(e)))
-            
-            task_queue.task_done()
-            
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[Device {device.device_id}] Worker error: {e}")
+    credentials = MockCredentials()
 
-def process_devices_with_queue(devices, tasks):
-    """
-    Process multiple devices using task queues
-    tasks = [(task_id, function, args), ...]
-    """
-    task_queue = queue.Queue()
-    result_queue = queue.Queue()
-    workers = []
-    
-    # Start worker thread for each device
-    for device in devices:
-        worker = threading.Thread(
-            target=device_worker,
-            args=(device, task_queue, result_queue),
-            daemon=True
-        )
-        worker.start()
-        workers.append(worker)
-    
-    # Add tasks to queue
-    for task in tasks:
-        task_queue.put(task)
-    
-    # Wait for all tasks to complete
-    task_queue.join()
-    
-    # Stop workers
-    for _ in workers:
-        task_queue.put(None)
-    
-    for worker in workers:
-        worker.join(timeout=2.0)
-    
-    # Collect results
-    results = []
-    while not result_queue.empty():
-        results.append(result_queue.get())
-    
-    return results
+# ------------------ Patch sga to use optimized serial ------------------
+original_get_pccid = getattr(sga, 'get_pccid', None)
+original_do_rw_only = getattr(sga, 'do_rw_only', None)
 
-def process_devices_sequential(devices, operation_func, *args):
-    """Process devices one at a time (safest method)"""
-    results = []
+if original_get_pccid and not isinstance(sga, type(lambda: None)):
+    def optimized_get_pccid():
+        device = device_pool.get_device()
+        if not device:
+            raise Exception("No devices available")
+        cmd = [0x01, 0x00, 0x00, 0x00] + [0] + [0]*32
+        result = do_serial_transfer(device, cmd)
+        pcc = ''.join('%02x' % e for e in result[5:21])
+        id_part = ''.join('%02x' % e for e in result[21:37])
+        return pcc + id_part
     
-    for device in devices:
-        try:
-            print(f"\n[Device {device.device_id}] Starting operation...")
-            result = operation_func(device, *args)
-            results.append((device.device_id, True, result))
-            print(f"[Device {device.device_id}] Operation completed successfully")
-            
-            # Add delay between devices to prevent conflicts
-            time.sleep(0.2)
-            
-        except Exception as e:
-            print(f"[Device {device.device_id}] Operation failed: {e}")
-            results.append((device.device_id, False, str(e)))
-    
-    return results
+    sga.get_pccid = optimized_get_pccid
 
-# Main execution example
-if __name__ == "__main__":
+if original_do_rw_only and not isinstance(sga, type(lambda: None)):
+    def optimized_do_rw_only(cw_list):
+        device = device_pool.get_device()
+        if not device:
+            raise Exception("No devices available")
+        cmd = [0x03, 0x00, 0x08, 0x00] + [0] + cw_list + [0] + [0]*49
+        result = do_serial_transfer(device, cmd)
+        rw = ''.join('%02x' % e for e in result[71:87])
+        return rw
+    
+    sga.do_rw_only = optimized_do_rw_only
+
+# ------------------ Flask App ------------------
+app = Flask(__name__)
+CORS(app)
+
+# ------------------ GPIO / LED Setup ------------------
+def gpio_setup():
     try:
-        # Initialize GPIO
+        import RPi.GPIO as GPIO
         GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        
-        # Detect and initialize devices
-        print("Detecting devices...")
-        devices = initialize_devices(interface='USB')
-        
-        if not devices:
-            print("No devices found!")
-            sys.exit(1)
-        
-        print(f"\nFound {len(devices)} device(s)\n")
-        
-        # Method 1: Sequential processing (RECOMMENDED for stability)
-        print("=== Sequential Processing ===")
-        results = process_devices_sequential(devices, get_pccid)
-        
-        print("\n=== Results ===")
-        for device_id, success, result in results:
-            if success:
-                print(f"Device {device_id}: SUCCESS - PCCID = {result}")
-            else:
-                print(f"Device {device_id}: FAILED - {result}")
-        
-        # Method 2: Queue-based processing (for complex workflows)
-        print("\n\n=== Queue-based Processing ===")
-        tasks = [
-            (f"task_{i}", get_pccid, ()) for i in range(len(devices))
-        ]
-        results = process_devices_with_queue(devices, tasks)
-        
-        print("\n=== Results ===")
-        for device_id, task_id, success, result in results:
-            if success:
-                print(f"Device {device_id} ({task_id}): SUCCESS - {result}")
-            else:
-                print(f"Device {device_id} ({task_id}): FAILED - {result}")
-        
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        GPIO.setup(5, GPIO.OUT)   # Green
+        GPIO.setup(6, GPIO.OUT)   # Red
+        GPIO.setup(12, GPIO.OUT)  # Yellow
+        GPIO.output(5, GPIO.LOW)
+        GPIO.output(6, GPIO.LOW)
+        GPIO.output(12, GPIO.HIGH)
+        return GPIO
+    except ImportError:
+        print("GPIO not available - running in mock mode")
+        return None
+
+GPIO = gpio_setup()
+
+def set_led_status(status):
+    if GPIO:
+        if status == 'green':
+            GPIO.output(5, GPIO.HIGH)
+            GPIO.output(6, GPIO.LOW)
+            GPIO.output(12, GPIO.LOW)
+        elif status == 'red':
+            GPIO.output(5, GPIO.LOW)
+            GPIO.output(6, GPIO.HIGH)
+            GPIO.output(12, GPIO.LOW)
+        elif status == 'yellow':
+            GPIO.output(5, GPIO.LOW)
+            GPIO.output(6, GPIO.LOW)
+            GPIO.output(12, GPIO.HIGH)
+    else:
+        print(f"Mock LED status: {status}")
+
+# ------------------ Logic Functions ------------------
+def status_logic():
+    return {
+        "status": "ok",
+        "message": "Raspberry Pi API is running",
+        "devices_available": len(device_pool.devices)
+    }
+
+def get_identity_logic():
+    set_led_status('yellow')
+    try:
+        identity = sga.get_pccid()
+        set_led_status('green')
+        return {"success": True, "identity": identity}
     except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        GPIO.cleanup()
+        set_led_status('red')
+        return {"success": False, "error": str(e)}
+
+def get_cw_logic(identity):
+    set_led_status('yellow')
+    try:
+        if not identity:
+            raise ValueError("Identity is required")
+        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
+            credentials.cloudflaretokens,
+            credentials.iotusername,
+            credentials.iotpassword
+        )
+        cw, transactionId = sga.get_cyberrock_cw(
+            credentials.cloudflaretokens,
+            iotaccesstoken,
+            identity,
+            False
+        )
+        set_led_status('green')
+        return {"success": True, "cw": cw, "transactionId": transactionId}
+    except Exception as e:
+        set_led_status('red')
+        return {"success": False, "error": str(e)}
+
+def get_rw_logic(cw):
+    set_led_status('yellow')
+    try:
+        if not cw:
+            raise ValueError("CW is required")
+
+        from math import log, ceil
+        def intToList(number):
+            L1 = log(number, 256)
+            L2 = ceil(L1)
+            if L1 == L2:
+                L2 += 1
+            return [(number & (0xff << 8*i)) >> 8*i for i in reversed(range(L2))]
+
+        cw_int = int(cw, 16)
+        cw_list = intToList(cw_int)
+        rw = sga.do_rw_only(cw_list)
+        set_led_status('green')
+        return {"success": True, "rw": rw}
+    except Exception as e:
+        set_led_status('red')
+        return {"success": False, "error": str(e)}
+
+def authenticate_logic(identity, cw, rw, transactionId):
+    set_led_status('yellow')
+    try:
+        if not all([identity, cw, rw, transactionId]):
+            raise ValueError("All parameters required")
+
+        iotaccesstoken, iotid = sga.do_cyberrock_iot_login(
+            credentials.cloudflaretokens, credentials.iotusername, credentials.iotpassword
+        )
+        sga.do_submit_rw(credentials.cloudflaretokens, iotaccesstoken, identity, cw, rw, transactionId, False)
+        auth_result, claim_id = sga.do_retrieve_result(credentials.cloudflaretokens, iotaccesstoken, transactionId, False)
+        set_led_status('green' if auth_result in ['CLAIM_ID', 'AUTH_OK'] else 'red')
+        return {"success": auth_result in ['CLAIM_ID', 'AUTH_OK'], "authResult": auth_result, "claimId": claim_id}
+    except Exception as e:
+        set_led_status('red')
+        return {"success": False, "error": str(e)}
+
+# ------------------ Flask Endpoints ------------------
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify(status_logic())
+
+@app.route('/api/get-identity', methods=['GET'])
+def get_identity():
+    return jsonify(get_identity_logic())
+
+@app.route('/api/get-cw', methods=['POST'])
+def get_cw():
+    data = request.get_json()
+    return jsonify(get_cw_logic(data.get('identity')))
+
+@app.route('/api/get-rw', methods=['POST'])
+def get_rw():
+    data = request.get_json()
+    return jsonify(get_rw_logic(data.get('cw')))
+
+@app.route('/api/authenticate', methods=['POST'])
+def authenticate():
+    data = request.get_json()
+    return jsonify(authenticate_logic(
+        data.get('identity'),
+        data.get('cw'),
+        data.get('rw'),
+        data.get('transactionId')
+    ))
+
+# ------------------ MQTT Integration ------------------
+DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
+BROKER = "3.67.46.166"
+
+def on_connect(client, userdata, flags, rc):
+    print(f"Connected to MQTT broker with result code {rc}")
+    client.subscribe(f"pi/{DEVICE_ID}/command")
+
+def on_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode())
+        function_name = payload.get("functionName")
+        args = payload.get("args", [])
+
+        if function_name == "status":
+            response = status_logic()
+        elif function_name == "get_identity":
+            response = get_identity_logic()
+        elif function_name == "get_cw":
+            identity = args[0].get("identity") if args else None
+            response = get_cw_logic(identity)
+        elif function_name == "get_rw":
+            cw = args[0].get("cw") if args else None
+            response = get_rw_logic(cw)
+        elif function_name == "authenticate":
+            params = args[0] if args else {}
+            response = authenticate_logic(
+                params.get("identity"),
+                params.get("cw"),
+                params.get("rw"),
+                params.get("transactionId")
+            )
+        else:
+            response = {"success": False, "error": f"Function {function_name} not found"}
+
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps(response))
+        print(f"Sent MQTT response: {response}")
+    except Exception as e:
+        client.publish(f"pi/{DEVICE_ID}/response", json.dumps({"success": False, "error": str(e)}))
+        print(f"MQTT error: {e}")
+
+def run_mqtt():
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(BROKER, 1883, 60)
+    client.loop_forever()
+
+# Start MQTT in a separate thread
+threading.Thread(target=run_mqtt, daemon=True).start()
+
+# ------------------ Run Flask ------------------
+if __name__ == "__main__":
+    print("="*60)
+    print("Starting Pi API Server with MQTT...")
+    print("="*60)
+    
+    # Initialize device pool
+    print("\nInitializing devices...")
+    if device_pool.initialize():
+        print(f"✓ {len(device_pool.devices)} device(s) ready")
+    else:
+        print("⚠ WARNING: No devices found!")
+    
+    print("\nStarting server on port 8000...")
+    print("="*60)
+    
+    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
