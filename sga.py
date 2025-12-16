@@ -114,7 +114,7 @@ def safe_serial(device, operation_name="unknown"):
     try:
         # Enforce minimum delay between operations
         elapsed = time.time() - device.last_operation_time
-        min_delay = 0.2  # Increased from 0.15
+        min_delay = 0.3  # Increased from 0.15
         if elapsed < min_delay:
             time.sleep(min_delay - elapsed)
         
@@ -123,7 +123,7 @@ def safe_serial(device, operation_name="unknown"):
             port=device.serial_port,
             baudrate=115200,
             timeout=3.0,  # Increased from 2.0
-            write_timeout=3.0,
+            write_timeout=4.0,
             exclusive=True
         )
         
@@ -159,7 +159,7 @@ def safe_serial(device, operation_name="unknown"):
         device.last_operation_time = time.time()
         time.sleep(0.15)  # Increased post-operation delay
 
-def do_ser_transfer_l(l, max_retries=3):
+def do_ser_transfer_l(l, max_retries=5):
     """Optimized serial transfer with automatic retry"""
     
     if not _device_pool.initialized:
