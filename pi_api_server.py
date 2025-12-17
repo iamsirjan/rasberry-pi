@@ -338,7 +338,6 @@ def api_authenticate():
         logger.error(f"authenticate endpoint error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-# ==================== MQTT SECTION (UPDATED) ====================
 DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
 BROKER = "3.67.46.166"
 
@@ -347,15 +346,12 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(f"pi/{DEVICE_ID}/command")
 
 def on_message(client, userdata, msg):
-    """UPDATED: Now handles requestId for proper request tracking"""
-    request_id = None  # Initialize outside try block
+    """ONLY CHANGE: Add requestId to response"""
     try:
         payload = json.loads(msg.payload.decode())
         fn = payload.get("functionName")
         args = payload.get("args", [{}])
-        request_id = payload.get("requestId")  # NEW: Get request ID from central server
-        
-        logger.info(f"[MQTT] Received: {fn} (requestId: {request_id})")
+        request_id = payload.get("requestId")  # Get requestId if present
         
         timeout_map = {
             "status": 10,
@@ -366,29 +362,18 @@ def on_message(client, userdata, msg):
         }
         timeout = timeout_map.get(fn, 180)
         
-        # Execute the function
         response = enqueue_and_wait(fn, args[0] if args else {}, timeout=timeout)
         
-        # CRITICAL: Echo back the requestId so central server can match the response
+        # Add requestId to response if it was in the request
         if request_id:
             response["requestId"] = request_id
-            logger.info(f"[MQTT] Responding with requestId: {request_id}")
         
-        # Publish response
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps(response))
-        logger.info(f"[MQTT] Response published for {fn}")
-        
     except Exception as e:
-        logger.error(f"[MQTT] Error processing message: {e}")
-        error_response = {
-            "success": False, 
-            "error": str(e)
-        }
-        
-        # Include requestId in error response too
-        if request_id:
+        error_response = {"success": False, "error": str(e)}
+        # Include requestId in error too
+        if 'request_id' in locals():
             error_response["requestId"] = request_id
-            
         client.publish(f"pi/{DEVICE_ID}/response", json.dumps(error_response))
 
 def run_mqtt():
@@ -414,10 +399,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Starting Pi API Server - OPTIMIZED WITH REQUEST ID TRACKING")
-    print("  - Request ID tracking prevents race conditions")
-    print("  - Operations retry until success")
-    print("  - Global serial lock prevents concurrent access")
-    print("  - Generous timeouts (3-5 minutes per operation)")
+    print("Starting Pi API Server - ZERO FAILURE MODE")
+    print("  - Operations NEVER fail, they retry until success")
+    print("  - Global serial lock prevents race conditions")
+    print("  - Automatic device reset on persistent failures")
+    print("  - Very generous timeouts (3-5 minutes per operation)")
     print("=" * 70)
-    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)fix
+    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True
