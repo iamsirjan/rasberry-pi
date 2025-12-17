@@ -339,7 +339,7 @@ def api_authenticate():
         return jsonify({"success": False, "error": str(e)}), 500
 
 DEVICE_ID = os.getenv("DEVICE_ID", "Pi-Default")
-BROKER = os.getenv("BROKER", "3.67.46.166")
+BROKER = "3.67.46.166"
 
 def on_connect(client, userdata, flags, rc):
     logger.info(f"[MQTT] Connected with result code {rc}")
