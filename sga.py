@@ -14,9 +14,9 @@ logger = logging.getLogger(__name__)
 environment = 'SANDBOX'
 interface = 'USB'
 
-# Optimized retry settings
-MAX_RETRIES = 5
-OPERATION_TIMEOUT = 30.0
+# Optimized settings
+MAX_RETRIES = 3
+INTER_REQUEST_DELAY = 0.5  # CRITICAL: Minimum time between operations
 
 # API Endpoints
 if environment == 'SANDBOX':
@@ -37,16 +37,19 @@ API_I_IDENT_PART2_LENGTH = 16
 API_I_RESP_START = 71
 API_I_RESP_LENGTH = 16
 
+# ==================== GLOBAL SERIAL LOCK ====================
+# THIS IS CRITICAL: Prevents concurrent access to serial port
+_GLOBAL_SERIAL_LOCK = threading.RLock()
+_last_global_operation = 0
+
 # ==================== DEVICE POOL ====================
 class DeviceConfig:
     def __init__(self, device_id, serial_port):
         self.device_id = device_id
         self.serial_port = serial_port
-        self.lock = threading.Lock()
-        self.last_operation_time = 0
-        self.consecutive_failures = 0
         self.total_operations = 0
         self.successful_operations = 0
+        self.consecutive_failures = 0
 
 class DevicePool:
     _instance = None
@@ -58,7 +61,6 @@ class DevicePool:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance.devices = []
-                    cls._instance.current_index = 0
                     cls._instance.initialized = False
         return cls._instance
     
@@ -91,49 +93,55 @@ class DevicePool:
         return len(self.devices) > 0
     
     def get_device(self):
-        """Round-robin device selection"""
+        """Get first available device"""
         if not self.devices:
             if not self.initialize():
                 raise Exception("No devices available")
         
-        with self._lock:
-            device = self.devices[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.devices)
-            return device
+        # Just return first device (we're using global lock anyway)
+        return self.devices[0]
 
 _device_pool = DevicePool()
 
-# ==================== OPTIMIZED SERIAL COMMUNICATION ====================
+# ==================== SERIALIZED SERIAL COMMUNICATION ====================
 @contextmanager
-def safe_serial_connection(device):
-    """Safe serial connection with proper timing"""
+def exclusive_serial_access(device):
+    """CRITICAL: Global lock ensures only ONE operation at a time"""
+    global _last_global_operation
+    
+    # Acquire GLOBAL lock (blocks all other threads)
+    _GLOBAL_SERIAL_LOCK.acquire()
+    
     ser = None
     try:
-        # Enforce minimum interval
-        elapsed = time.time() - device.last_operation_time
-        min_interval = 0.25
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
+        # Enforce MANDATORY delay between operations
+        elapsed = time.time() - _last_global_operation
+        if elapsed < INTER_REQUEST_DELAY:
+            wait_time = INTER_REQUEST_DELAY - elapsed
+            logger.debug(f"Enforcing {wait_time:.3f}s delay between operations")
+            time.sleep(wait_time)
         
-        # Open port
+        # Open port with MAXIMUM exclusivity
+        logger.debug(f"Opening {device.serial_port}...")
         ser = serial.Serial(
             port=device.serial_port,
             baudrate=115200,
-            timeout=3.0,
-            write_timeout=3.0,
+            timeout=4.0,
+            write_timeout=4.0,
             exclusive=True,
-            inter_byte_timeout=0.2
+            inter_byte_timeout=0.3
         )
         
         # Device settling time (CRITICAL!)
-        time.sleep(0.15)
+        time.sleep(0.2)
         
-        # Clear buffers thoroughly
+        # Aggressive buffer clearing
         for _ in range(3):
             ser.reset_input_buffer()
             ser.reset_output_buffer()
-            time.sleep(0.03)
+            time.sleep(0.05)
         
+        logger.debug("Port ready")
         yield ser
         
     finally:
@@ -141,93 +149,104 @@ def safe_serial_connection(device):
             try:
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
-                time.sleep(0.05)
+                time.sleep(0.1)
                 ser.close()
-            except:
-                pass
+                logger.debug("Port closed")
+            except Exception as e:
+                logger.error(f"Error closing port: {e}")
         
-        device.last_operation_time = time.time()
-        # Post-operation rest (prevents "device not ready" errors)
-        time.sleep(0.2)
+        # Update last operation time
+        _last_global_operation = time.time()
+        
+        # Mandatory cool-down period
+        time.sleep(0.3)
+        
+        # Release GLOBAL lock
+        _GLOBAL_SERIAL_LOCK.release()
 
-def read_response_smart(ser, expected_bytes=144, timeout=5.0):
-    """Smart response reading with proper timeout handling"""
+def read_response_robust(ser, expected_bytes=144, timeout=6.0):
+    """Robust response reading that handles 'ghost data' problem"""
     response = b''
     start_time = time.time()
     last_data_time = start_time
-    no_data_cycles = 0
-    max_no_data_cycles = 15  # 0.3 seconds without data
+    consecutive_empty_reads = 0
+    max_empty_reads = 5
+    
+    logger.debug("Reading response...")
     
     while time.time() - start_time < timeout:
         try:
             waiting = ser.in_waiting
             
             if waiting > 0:
-                # Data available
+                # Data reported available
                 chunk = ser.read(waiting)
+                
                 if len(chunk) > 0:
+                    # Actually got data
                     response += chunk
                     last_data_time = time.time()
-                    no_data_cycles = 0
+                    consecutive_empty_reads = 0
+                    logger.debug(f"Read {len(chunk)} bytes (total: {len(response)})")
                     
-                    # Check if we have enough
+                    # Check if complete
                     if len(response) >= expected_bytes:
+                        logger.debug("Response complete")
                         break
                 else:
-                    # THE PROBLEM: in_waiting > 0 but read returns nothing
-                    no_data_cycles += 1
-                    if no_data_cycles > 3:
-                        logger.warning(f"Ghost data detected (waiting={waiting}, got=0)")
-                        # Force a small delay and continue
-                        time.sleep(0.1)
-                        no_data_cycles = 0
+                    # THE PROBLEM: in_waiting > 0 but read returned nothing
+                    consecutive_empty_reads += 1
+                    logger.warning(f"Ghost data: waiting={waiting}, got=0 (occurrence #{consecutive_empty_reads})")
+                    
+                    if consecutive_empty_reads >= max_empty_reads:
+                        if len(response) > 0:
+                            logger.warning(f"Too many ghost reads, using {len(response)} bytes")
+                            break
+                        else:
+                            raise Exception("Device stuck - reporting data but sending nothing")
+                    
+                    # Force delay to let device catch up
+                    time.sleep(0.15)
             else:
                 # No data waiting
                 if len(response) > 0:
-                    # We have some data, check if we should stop waiting
+                    # We have partial data, check if we should stop
                     stall_time = time.time() - last_data_time
-                    if stall_time > 0.5:
-                        # No new data for 0.5s, probably complete
-                        if len(response) >= expected_bytes * 0.7:  # At least 70% of expected
+                    if stall_time > 1.0:
+                        # No new data for 1 second
+                        if len(response) >= expected_bytes * 0.6:
+                            logger.debug(f"Stalled with {len(response)} bytes - using it")
                             break
                 
-                no_data_cycles += 1
-                if no_data_cycles > max_no_data_cycles:
-                    # Too many cycles without data
-                    if len(response) == 0:
-                        raise Exception("Device not responding")
-                    else:
-                        # Have some data, use it
-                        break
-            
-            time.sleep(0.02)
+                time.sleep(0.03)
             
         except serial.SerialException as e:
-            logger.error(f"Serial exception during read: {e}")
+            logger.error(f"Serial exception: {e}")
             if len(response) > 0:
-                break  # Use what we have
+                break
             raise
     
     if len(response) == 0:
-        raise Exception("No data received from device")
+        raise Exception("No response from device after {:.1f}s".format(time.time() - start_time))
     
+    logger.debug(f"Response read complete: {len(response)} bytes")
     return response
 
 def parse_hex_response(response_bytes):
-    """Parse hex response with robust error handling"""
-    # Decode to string
+    """Parse hex response with error handling"""
+    # Decode
     try:
-        response_str = response_bytes.decode('utf-8', errors='ignore')
+        response_str = response_bytes.decode('utf-8', errors='ignore').strip()
     except:
-        response_str = response_bytes.decode('ascii', errors='ignore')
+        response_str = response_bytes.decode('ascii', errors='ignore').strip()
     
-    # Extract only hex characters
+    # Extract hex chars only
     hex_chars = ''.join(c for c in response_str if c in '0123456789abcdefABCDEF')
     
-    if len(hex_chars) < 10:
-        raise Exception(f"Invalid response format (only {len(hex_chars)} hex chars)")
+    if len(hex_chars) < 20:
+        raise Exception(f"Invalid response: only {len(hex_chars)} hex chars")
     
-    # Convert to byte list
+    # Convert to bytes
     byte_list = []
     for i in range(0, len(hex_chars) - 1, 2):
         try:
@@ -241,7 +260,7 @@ def parse_hex_response(response_bytes):
     return byte_list
 
 def do_ser_transfer_l(l):
-    """Optimized serial transfer with smart retry"""
+    """Thread-safe serial transfer with GLOBAL lock"""
     if not _device_pool.initialized:
         _device_pool.initialize()
     
@@ -249,60 +268,54 @@ def do_ser_transfer_l(l):
     last_error = None
     
     for attempt in range(MAX_RETRIES):
-        with device.lock:
-            try:
-                logger.debug(f"Transfer attempt {attempt + 1}/{MAX_RETRIES}")
+        try:
+            logger.info(f"Transfer attempt {attempt + 1}/{MAX_RETRIES}")
+            
+            # CRITICAL: This blocks until no other operation is in progress
+            with exclusive_serial_access(device) as ser:
+                # Send command
+                cmd = ''.join('%02x' % e for e in l) + "\r"
+                bytes_written = ser.write(cmd.encode('utf-8'))
+                ser.flush()
                 
-                with safe_serial_connection(device) as ser:
-                    # Send command
-                    cmd = ''.join('%02x' % e for e in l) + "\r"
-                    bytes_written = ser.write(cmd.encode('utf-8'))
-                    ser.flush()
-                    
-                    if bytes_written != len(cmd):
-                        raise Exception(f"Incomplete write: {bytes_written}/{len(cmd)} bytes")
-                    
-                    # CRITICAL: Wait for device to process command
-                    # This is the KEY to preventing "no data" errors
-                    if l[0] == 0x01:  # Identity command
-                        process_time = 0.25
-                    elif l[0] == 0x03:  # Challenge-response
-                        process_time = 0.30
-                    else:
-                        process_time = 0.25
-                    
-                    time.sleep(process_time)
-                    
-                    # Read response
-                    response_bytes = read_response_smart(ser, expected_bytes=144, timeout=5.0)
-                    
-                    # Parse response
-                    byte_list = parse_hex_response(response_bytes)
-                    
-                    # Success!
-                    device.consecutive_failures = 0
-                    device.successful_operations += 1
-                    device.total_operations += 1
-                    
-                    logger.info(f"✓ Transfer successful: {len(byte_list)} bytes")
-                    return byte_list
-                    
-            except Exception as e:
-                last_error = e
-                device.consecutive_failures += 1
+                logger.debug(f"Sent {bytes_written} bytes")
+                
+                # CRITICAL: Wait for device to process
+                if l[0] == 0x01:  # Identity
+                    process_time = 0.35
+                elif l[0] == 0x03:  # Challenge-response
+                    process_time = 0.40
+                else:
+                    process_time = 0.35
+                
+                logger.debug(f"Waiting {process_time}s for device to process...")
+                time.sleep(process_time)
+                
+                # Read response
+                response_bytes = read_response_robust(ser, expected_bytes=144, timeout=6.0)
+                
+                # Parse
+                byte_list = parse_hex_response(response_bytes)
+                
+                # Success!
+                device.consecutive_failures = 0
+                device.successful_operations += 1
                 device.total_operations += 1
                 
-                logger.warning(f"✗ Attempt {attempt + 1} failed: {e}")
+                logger.info(f"✓ Transfer successful: {len(byte_list)} bytes")
+                return byte_list
                 
-                # Exponential backoff
-                if attempt < MAX_RETRIES - 1:
-                    backoff = min(0.5 * (2 ** attempt), 3.0)  # Max 3 seconds
-                    logger.info(f"Retrying in {backoff:.1f}s...")
-                    time.sleep(backoff)
-                    
-                    # Hard reset on consecutive failures
-                    if device.consecutive_failures >= 3:
-                        logger.warning(f"Device has {device.consecutive_failures} failures - power cycle recommended")
+        except Exception as e:
+            last_error = e
+            device.consecutive_failures += 1
+            device.total_operations += 1
+            
+            logger.error(f"✗ Attempt {attempt + 1} failed: {e}")
+            
+            if attempt < MAX_RETRIES - 1:
+                backoff = 1.0 * (attempt + 1)
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
     
     # All retries failed
     raise Exception(f"Transfer failed after {MAX_RETRIES} attempts. Last error: {last_error}")
@@ -327,7 +340,7 @@ def assemble_cw_l(l_challenge):
 # ==================== RESPONSE DISASSEMBLY ====================
 def disassemble_l_id(l_r):
     if len(l_r) < API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH:
-        raise Exception(f"Response too short: {len(l_r)} bytes (expected at least 37)")
+        raise Exception(f"Response too short: {len(l_r)} bytes")
     
     l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
     l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
@@ -335,7 +348,7 @@ def disassemble_l_id(l_r):
 
 def disassemble_l_rw(l_r):
     if len(l_r) < API_I_RESP_START + API_I_RESP_LENGTH:
-        raise Exception(f"Response too short: {len(l_r)} bytes (expected at least 87)")
+        raise Exception(f"Response too short: {len(l_r)} bytes")
     
     l_pcc = l_r[API_I_IDENT_PART1_START : API_I_IDENT_PART1_START + API_I_IDENT_PART1_LENGTH]
     l_id = l_r[API_I_IDENT_PART2_START : API_I_IDENT_PART2_START + API_I_IDENT_PART2_LENGTH]
@@ -345,7 +358,7 @@ def disassemble_l_rw(l_r):
 # ==================== DEVICE OPERATIONS ====================
 def get_pccid():
     """Get PCCID from device"""
-    logger.info("Getting PCCID...")
+    logger.info(">>> get_pccid() called")
     l_r = do_transfer_l(assemble_id_l())
     l_pcc, l_id = disassemble_l_id(l_r)
     
@@ -353,22 +366,21 @@ def get_pccid():
     s_id = ''.join('%02x' % e for e in l_id)
     result = s_pcc + s_id
     
-    logger.info(f"PCCID retrieved: {result}")
+    logger.info(f"<<< get_pccid() returning: {result}")
     return result
 
 def do_rw_only(cw_l):
-    """Get RW response from device"""
-    logger.info("Getting RW...")
+    """Get RW response"""
+    logger.info(">>> do_rw_only() called")
     l_r = do_transfer_l(assemble_cw_l(cw_l))
     l_pcc, l_id, l_rw = disassemble_l_rw(l_r)
     
     s_rw = ''.join('%02x' % e for e in l_rw)
-    logger.info(f"RW retrieved: {s_rw}")
+    logger.info(f"<<< do_rw_only() returning: {s_rw}")
     return s_rw
 
-# ==================== CYBERROCK API FUNCTIONS ====================
+# ==================== CYBERROCK API ====================
 def do_cyberrock_iot_login(cloudflaretokens, iotusername, iotpassword):
-    logger.debug("Logging in to CyberRock IoT...")
     response = requests.post(cyberrock_iot_login,
         headers=cloudflaretokens,
         data={'username': iotusername, 'password': iotpassword},
@@ -377,7 +389,6 @@ def do_cyberrock_iot_login(cloudflaretokens, iotusername, iotpassword):
     return logindata['accessToken'], logindata['iotId']
 
 def get_cyberrock_cw(cloudflaretokens, accesstoken, PCCID, requestSignature):
-    logger.debug("Requesting CW from CyberRock...")
     data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
     data_post = {"requestSignedResponse": requestSignature, "PCCID": PCCID}
     response = requests.post(cyberrock_iot_requestcw,
@@ -386,7 +397,6 @@ def get_cyberrock_cw(cloudflaretokens, accesstoken, PCCID, requestSignature):
     return cwdata['CW'], cwdata['transactionId']
 
 def do_submit_rw(cloudflaretokens, accesstoken, PCCID, CW, RW, transactionid, requestSignature):
-    logger.debug("Submitting RW to CyberRock...")
     data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
     data_post = {
         "requestSignedResponse": requestSignature,
@@ -400,7 +410,6 @@ def do_submit_rw(cloudflaretokens, accesstoken, PCCID, CW, RW, transactionid, re
     return response.json()['transactionId']
 
 def do_retrieve_result(cloudflaretokens, accesstoken, transactionid, requestSignature):
-    logger.debug("Retrieving auth result from CyberRock...")
     data_auth = cloudflaretokens | {'Authorization': 'Bearer ' + accesstoken}
     params_post = {"transactionId": transactionid}
     data_post = {"requestSignedResponse": requestSignature}
@@ -430,4 +439,5 @@ def gpio_setup():
 
 gpio_setup()
 logger.info(f"SGA Module loaded - Environment: {environment}, Interface: {interface}")
-logger.info(f"Retry policy: {MAX_RETRIES} attempts, {OPERATION_TIMEOUT}s timeout")
+logger.info(f"GLOBAL LOCK enabled - only 1 operation at a time")
+logger.info(f"Inter-request delay: {INTER_REQUEST_DELAY}s")
